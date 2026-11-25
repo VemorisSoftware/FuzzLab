@@ -1,0 +1,1 @@
+{"url": "http://127.0.0.1:8790", "openapi": "http://127.0.0.1:8790/openapi.json", "casos_por_endpoint": 30, "limite_ms": 1500, "salida": "salida-web-api", "tasa_maxima": 100}

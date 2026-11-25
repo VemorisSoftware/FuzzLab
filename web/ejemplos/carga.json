@@ -1,0 +1,1 @@
+{"url": "http://127.0.0.1:8790", "escenario": [{"metodo": "GET", "ruta": "/hola"}, {"metodo": "GET", "ruta": "/"}], "tasa": 300, "duracion_s": 8, "trabajadores": 4, "umbrales": {"p95_ms": 50, "errores_pct": 1, "tasa_min": 250}, "salida": "salida-web-carga"}

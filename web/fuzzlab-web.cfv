@@ -1,0 +1,975 @@
+// web/fuzzlab-web.cfv — Fuzz Lab Web de Vemoris Software.
+//
+// Pone a prueba sitios web y APIs propias, 100 % en C-Forge:
+//
+//   fuzzlab-web carga   objetivo.json   prueba de carga (tasa fija o usuarios) con umbrales
+//   fuzzlab-web api     objetivo.json   ataca una API a partir de su OpenAPI
+//   fuzzlab-web rutas   objetivo.json   busca archivos y rutas expuestas; FUZZ en la URL
+//   fuzzlab-web revisar objetivo.json   plantillas de seguridad (cabeceras, cookies, XSS…)
+//
+//   cforge build web/fuzzlab-web.cfv -o fuzzlab-web
+//
+// 🔒 Solo ataca los dominios de "autorizados" (por defecto: 127.0.0.1 y
+// localhost). Úsalo solo contra sistemas propios o con permiso escrito.
+
+importar "json"
+importar "sistema"
+importar "tls"
+
+// ── Utilidades ──────────────────────────────────────────────────────────
+
+funcion azar(n) {
+    si (n <= 0) { retornar 0 }
+    retornar aleatorio_entero(0, n - 1)
+}
+funcion elegir(l) { retornar l[azar(longitud(l))] }
+funcion valor(m, clave, defecto) {
+    si (m != nulo y tiene_clave(m, clave)) { retornar m[clave] }
+    retornar defecto
+}
+funcion empieza(t, p) { retornar longitud(t) >= longitud(p) y subtexto(t, 0, longitud(p)) == p }
+funcion termina(t, p) { retornar longitud(t) >= longitud(p) y subtexto(t, longitud(t) - longitud(p), longitud(t)) == p }
+funcion contiene_t(t, p) { retornar texto_indice(t, p) >= 0 }
+funcion minus(t) { retornar texto_minusculas(t) }
+funcion comillas(t) { retornar "'" + texto_reemplazar(t, "'", "'\\''") + "'" }
+
+funcion host_de(url) {
+    sea s = url
+    sea p = texto_indice(s, "://")
+    si (p >= 0) { s = subtexto(s, p + 3, longitud(s)) }
+    sea fin = longitud(s)
+    para c en ["/", "?", "#"] {
+        sea k = texto_indice(s, c)
+        si (k >= 0 y k < fin) { fin = k }
+    }
+    s = subtexto(s, 0, fin)
+    sea arroba = texto_indice(s, "@")
+    si (arroba >= 0) { s = subtexto(s, arroba + 1, longitud(s)) }
+    sea dos = texto_indice(s, ":")
+    si (dos >= 0) { s = subtexto(s, 0, dos) }
+    retornar minus(s)
+}
+
+funcion unir_url(base, ruta) {
+    si (empieza(ruta, "http://") o empieza(ruta, "https://")) { retornar ruta }
+    sea b = base
+    si (termina(b, "/")) { b = subtexto(b, 0, longitud(b) - 1) }
+    si (no empieza(ruta, "/")) { ruta = "/" + ruta }
+    retornar b + ruta
+}
+
+funcion codificar(t) { retornar cfv_url_codificar(a_texto(t)) }
+
+// ── Configuración y autorización ────────────────────────────────────────
+
+sea ARGS = argumentos()
+si (longitud(ARGS) >= 1 y ARGS[0] == "_trabajador") {
+    // modo interno de la prueba de carga (más abajo)
+} sino {
+    si (longitud(ARGS) < 2) {
+        mostrar("Uso: fuzzlab-web carga|api|rutas|revisar objetivo.json")
+        salir(2)
+    }
+}
+sea MODO = ARGS[0]
+sea CFG = {}
+si (MODO == "_trabajador") { CFG = cfv_json_parsear(leer_archivo(ARGS[1])) } sino { CFG = cfv_json_parsear(leer_archivo(ARGS[1])) }
+
+sea AUTORIZADOS = valor(CFG, "autorizados", ["127.0.0.1", "localhost", "::1"])
+sea BASE = valor(CFG, "url", "")
+sea SALIDA = valor(CFG, "salida", "fuzzlab-web-salida")
+sea CABECERAS = valor(CFG, "cabeceras", {})
+sea TASA_SEGURA = valor(CFG, "tasa_maxima", 50)          // peticiones por segundo en api/rutas/revisar
+
+funcion autorizado(url) {
+    sea h = host_de(url)
+    para a en AUTORIZADOS {
+        si (h == minus(a) o termina(h, "." + minus(a))) { retornar verdadero }
+    }
+    retornar falso
+}
+si (BASE != "" y no autorizado(BASE)) {
+    mostrar("🔒 " + host_de(BASE) + " no está en \"autorizados\". Agrega el dominio solo si es tuyo o tienes permiso escrito.")
+    salir(3)
+}
+
+// ── Peticiones ──────────────────────────────────────────────────────────
+
+sea PETICIONES = 0
+sea ULTIMA_PETICION = 0
+
+// Respeta la tasa máxima (no saturar el sitio sin querer).
+funcion pausar() {
+    si (TASA_SEGURA <= 0) { retornar nulo }
+    sea espera = piso(1000 / TASA_SEGURA) - (tiempo_ms() - ULTIMA_PETICION)
+    si (espera > 0) { dormir(espera) }
+    ULTIMA_PETICION = tiempo_ms()
+}
+
+// Partes de una URL: {"https", "host", "puerto", "ruta"}.
+funcion partes_url(url) {
+    sea https = empieza(minus(url), "https://")
+    sea resto = url
+    sea p = texto_indice(resto, "://")
+    si (p >= 0) { resto = subtexto(resto, p + 3, longitud(resto)) }
+    sea barra = texto_indice(resto, "/")
+    sea hostport = resto
+    sea ruta = "/"
+    si (barra >= 0) {
+        hostport = subtexto(resto, 0, barra)
+        ruta = subtexto(resto, barra, longitud(resto))
+    }
+    sea puerto = 80
+    si (https) { puerto = 443 }
+    sea dos = texto_indice(hostport, ":")
+    sea host = hostport
+    si (dos >= 0) {
+        host = subtexto(hostport, 0, dos)
+        puerto = a_numero(subtexto(hostport, dos + 1, longitud(hostport)))
+    }
+    retornar {"https": https, "host": host, "puerto": puerto, "ruta": ruta, "hostport": hostport}
+}
+
+// Cuerpo con "Transfer-Encoding: chunked" → cuerpo normal.
+funcion des_chunked(c) {
+    sea partes = []
+    sea i = 0
+    mientras (i < longitud(c)) {
+        sea fin = texto_indice(subtexto(c, i, longitud(c)), "\r\n")
+        si (fin < 0) { retornar texto_unir(partes, "") }
+        sea hex = texto_recortar(texto_dividir(subtexto(c, i, i + fin), ";")[0])
+        sea n = 0
+        para k en rango(0, longitud(hex)) {
+            sea b = byte_en(hex, k)
+            sea d = 0
+            si (b >= 48 y b <= 57) { d = b - 48 } sino si (b >= 97 y b <= 102) { d = b - 87 } sino si (b >= 65 y b <= 70) { d = b - 55 }
+            n = n * 16 + d
+        }
+        si (n == 0) { retornar texto_unir(partes, "") }
+        i = i + fin + 2
+        agregar(partes, subtexto(c, i, minimo(i + n, longitud(c))))
+        i = i + n + 2
+    }
+    retornar texto_unir(partes, "")
+}
+
+// Cliente HTTP propio (HTTP/1.1 sobre TCP, o TLS para https). NUNCA sigue
+// redirecciones: así jamás termina en un dominio no autorizado. Todas las
+// cabeceras repetidas (Set-Cookie) quedan unidas con saltos de línea.
+funcion http_crudo(metodo, url, cuerpo, cab, limite_ms) {
+    sea u = partes_url(url)
+    sea lineas = [metodo + " " + u["ruta"] + " HTTP/1.1", "Host: " + u["hostport"], "Connection: close", "Accept: */*"]
+    para k en mapa_claves(cab) { agregar(lineas, k + ": " + a_texto(cab[k])) }
+    si (cuerpo != "" y cuerpo != nulo) { agregar(lineas, "Content-Length: " + longitud(cuerpo)) }
+    sea peticion = texto_unir(lineas, "\r\n") + "\r\n\r\n"
+    si (cuerpo != nulo) { peticion = peticion + cuerpo }
+    sea sock = net_conectar(u["host"], u["puerto"])
+    net_espera(sock, limite_ms)
+    sea crudo = ""
+    si (u["https"]) {
+        sea t = tls_abrir(sock, u["host"])
+        tls_enviar(t, peticion)
+        crudo = tls_recibir_todo(t)
+        tls_cerrar(t)
+    } sino {
+        net_enviar(sock, peticion)
+        crudo = net_recibir_todo(sock)
+        net_cerrar(sock)
+    }
+    sea sep = texto_indice(crudo, "\r\n\r\n")
+    si (sep < 0) { lanzar "respuesta incompleta (" + longitud(crudo) + " bytes)" }
+    sea cabecera_txt = subtexto(crudo, 0, sep)
+    sea cuerpo_r = subtexto(crudo, sep + 4, longitud(crudo))
+    sea filas = texto_dividir(cabecera_txt, "\r\n")
+    sea estado = a_numero(texto_dividir(filas[0], " ")[1])
+    sea cabs = {}
+    para i en rango(1, longitud(filas)) {
+        sea dos = texto_indice(filas[i], ":")
+        si (dos > 0) {
+            sea k = minus(texto_recortar(subtexto(filas[i], 0, dos)))
+            sea v = texto_recortar(subtexto(filas[i], dos + 1, longitud(filas[i])))
+            si (tiene_clave(cabs, k)) { cabs[k] = cabs[k] + "\n" + v } sino { cabs[k] = v }
+        }
+    }
+    si (contiene_t(minus(valor(cabs, "transfer-encoding", "")), "chunked")) { cuerpo_r = des_chunked(cuerpo_r) }
+    retornar {"estado": estado, "cabeceras": cabs, "cuerpo": cuerpo_r}
+}
+
+sea LIMITE_PETICION_MS = valor(CFG, "espera_ms", 10000)
+
+// Hace una petición y devuelve {"estado", "cabeceras", "cuerpo", "ms", "error"}.
+funcion pedir(metodo, url, cuerpo, cabeceras_extra) {
+    si (no autorizado(url)) { retornar {"estado": 0, "cabeceras": {}, "cuerpo": "", "ms": 0, "error": "no autorizado: " + host_de(url)} }
+    sea cab = {}
+    para k en mapa_claves(CABECERAS) { cab[k] = CABECERAS[k] }
+    si (cabeceras_extra != nulo) { para k en mapa_claves(cabeceras_extra) { cab[k] = cabeceras_extra[k] } }
+    si (no tiene_clave(cab, "User-Agent")) { cab["User-Agent"] = "VemorisFuzzLab/1.0" }
+    sea t0 = tiempo_ms()
+    PETICIONES += 1
+    intentar {
+        sea r = http_crudo(metodo, url, cuerpo, cab, LIMITE_PETICION_MS + 1000)
+        retornar {"estado": r["estado"], "cabeceras": r["cabeceras"], "cuerpo": r["cuerpo"], "ms": tiempo_ms() - t0, "error": ""}
+    } capturar (e) {
+        retornar {"estado": 0, "cabeceras": {}, "cuerpo": "", "ms": tiempo_ms() - t0, "error": a_texto(e)}
+    }
+}
+
+funcion cabecera(r, nombre) {
+    sea c = r["cabeceras"]
+    si (c == nulo) { retornar "" }
+    para k en mapa_claves(c) { si (minus(k) == minus(nombre)) { retornar a_texto(c[k]) } }
+    retornar ""
+}
+
+funcion curl(metodo, url, cuerpo, cab) {
+    sea s = "curl -i -X " + metodo + " " + comillas(url)
+    si (cab != nulo) { para k en mapa_claves(cab) { s = s + " -H " + comillas(k + ": " + cab[k]) } }
+    si (cuerpo != "" y cuerpo != nulo) { s = s + " --data-raw " + comillas(cuerpo) }
+    retornar s
+}
+
+// ── Hallazgos y reporte ─────────────────────────────────────────────────
+
+sea HALLAZGOS = []
+sea FIRMAS = {}
+sea ORDEN_SEVERIDAD = {"crítica": 0, "alta": 1, "media": 2, "baja": 3, "info": 4}
+sea ICONO = {"crítica": "🔴", "alta": "🟠", "media": "🟡", "baja": "🔵", "info": "⚪"}
+
+funcion hallazgo(severidad, titulo, detalle, reproducir, firma) {
+    si (tiene_clave(FIRMAS, firma)) { retornar nulo }
+    FIRMAS[firma] = verdadero
+    agregar(HALLAZGOS, {"severidad": severidad, "titulo": titulo, "detalle": detalle, "reproducir": reproducir})
+    mostrar("  " + ICONO[severidad] + " " + titulo + " — " + detalle)
+}
+
+funcion por_severidad(a, b) { retornar ORDEN_SEVERIDAD[a["severidad"]] - ORDEN_SEVERIDAD[b["severidad"]] }
+
+funcion escribir_reporte(titulo, resumen, extra) {
+    crear_carpeta(SALIDA)
+    sea r = []
+    agregar(r, "# 🔬 " + titulo)
+    agregar(r, "")
+    para l en resumen { agregar(r, "- " + l) }
+    agregar(r, "")
+    si (longitud(HALLAZGOS) == 0) {
+        agregar(r, "✅ Sin hallazgos.")
+    } sino {
+        sea cuenta = {}
+        para h en HALLAZGOS { cuenta[h["severidad"]] = valor(cuenta, h["severidad"], 0) + 1 }
+        sea partes = []
+        para s en ["crítica", "alta", "media", "baja", "info"] { si (tiene_clave(cuenta, s)) { agregar(partes, ICONO[s] + " " + cuenta[s] + " " + s) } }
+        agregar(r, "**Hallazgos:** " + texto_unir(partes, " · "))
+        agregar(r, "")
+        para h en ordenar(HALLAZGOS, por_severidad) {
+            agregar(r, "### " + ICONO[h["severidad"]] + " " + h["titulo"])
+            agregar(r, "")
+            agregar(r, h["detalle"])
+            si (h["reproducir"] != "") {
+                agregar(r, "")
+                agregar(r, "```sh")
+                agregar(r, h["reproducir"])
+                agregar(r, "```")
+            }
+            agregar(r, "")
+        }
+    }
+    para l en extra { agregar(r, l) }
+    escribir_archivo(SALIDA + "/REPORTE.md", texto_unir(r, "\n") + "\n")
+    escribir_archivo(SALIDA + "/hallazgos.json", json_bonito(HALLAZGOS))
+    mostrar("")
+    mostrar("  Reporte: " + SALIDA + "/REPORTE.md (" + longitud(HALLAZGOS) + " hallazgos, " + PETICIONES + " peticiones)")
+}
+
+funcion salir_segun(hallazgos_graves) {
+    si (hallazgos_graves) { salir(1) }
+    salir(0)
+}
+
+funcion hay_graves() {
+    para h en HALLAZGOS { si (h["severidad"] == "crítica" o h["severidad"] == "alta") { retornar verdadero } }
+    retornar falso
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// CARGA — tasa fija (como vegeta/wrk) o usuarios virtuales (como k6/locust)
+// ═════════════════════════════════════════════════════════════════════
+//   "url": "http://127.0.0.1:8080",
+//   "escenario": [{"metodo": "GET", "ruta": "/"}, {"metodo": "POST", "ruta": "/api/x", "cuerpo": "{}", "esperar": 201}],
+//   "tasa": 200,                 peticiones por segundo en total (modelo abierto)
+//   "usuarios": 20,              o: usuarios simultáneos sin pausa (modelo cerrado)
+//   "duracion_s": 30,
+//   "trabajadores": 4,           procesos en paralelo
+//   "umbrales": {"p95_ms": 300, "p99_ms": 800, "errores_pct": 1, "tasa_min": 150}
+
+funcion escenario() {
+    sea e = valor(CFG, "escenario", [])
+    si (longitud(e) == 0) { e = [{"metodo": "GET", "ruta": "/"}] }
+    retornar e
+}
+
+funcion trabajador_carga(id, trabajadores, archivo) {
+    sea pasos = escenario()
+    sea duracion = valor(CFG, "duracion_s", 30) * 1000
+    sea tasa = valor(CFG, "tasa", 0)
+    sea usuarios = valor(CFG, "usuarios", 0)
+    // Cada proceso lleva su parte de la tasa (o de los usuarios, uno tras otro).
+    sea intervalo = 0
+    si (tasa > 0) { intervalo = 1000 * trabajadores / tasa }
+    sea lineas = []
+    sea inicio = tiempo_ms()
+    sea siguiente = inicio + id * intervalo / trabajadores
+    sea k = 0
+    mientras (tiempo_ms() - inicio < duracion) {
+        si (intervalo > 0) {
+            sea espera = siguiente - tiempo_ms()
+            si (espera > 0) { dormir(piso(espera)) }
+            siguiente = siguiente + intervalo
+        }
+        sea p = pasos[k % longitud(pasos)]
+        k += 1
+        sea url = unir_url(BASE, valor(p, "ruta", "/"))
+        sea r = pedir(valor(p, "metodo", "GET"), url, valor(p, "cuerpo", ""), valor(p, "cabeceras", nulo))
+        sea esperado = valor(p, "esperar", 0)
+        sea ok = r["error"] == "" y r["estado"] < 400
+        si (esperado != 0) { ok = r["estado"] == esperado }
+        sea marca = "ok"
+        si (no ok) {
+            marca = "falla"
+            si (r["error"] != "") { marca = "error" }
+        }
+        agregar(lineas, (tiempo_ms() - inicio) + " " + r["ms"] + " " + r["estado"] + " " + marca + " " + valor(p, "ruta", "/"))
+        si (longitud(lineas) >= 2000) {
+            sea previo = ""
+            si (existe_archivo(archivo)) { previo = leer_archivo(archivo) }
+            escribir_archivo(archivo, previo + texto_unir(lineas, "\n") + "\n")
+            lineas = []
+        }
+    }
+    sea previo = ""
+    si (existe_archivo(archivo)) { previo = leer_archivo(archivo) }
+    escribir_archivo(archivo, previo + texto_unir(lineas, "\n") + "\n")
+}
+
+si (MODO == "_trabajador") {
+    TASA_SEGURA = 0
+    trabajador_carga(a_numero(ARGS[2]), a_numero(ARGS[3]), ARGS[4])
+    salir(0)
+}
+
+funcion percentil(lista_ordenada, p) {
+    si (longitud(lista_ordenada) == 0) { retornar 0 }
+    sea i = piso(p * (longitud(lista_ordenada) - 1) / 100)
+    retornar lista_ordenada[i]
+}
+
+sea FILAS_UMBRAL = []
+funcion revisar_umbral(nombre, medido, limite, mayor_es_malo) {
+    sea ok = medido <= limite
+    si (no mayor_es_malo) { ok = medido >= limite }
+    sea signo = "≤"
+    si (no mayor_es_malo) { signo = "≥" }
+    sea marca = "✅"
+    si (no ok) { marca = "❌" }
+    agregar(FILAS_UMBRAL, "| " + nombre + " | " + medido + " | " + signo + " " + limite + " | " + marca + " |")
+    si (no ok) { hallazgo("alta", "Umbral no cumplido: " + nombre, "Medido " + medido + ", se esperaba " + signo + " " + limite + ".", "", "umbral|" + nombre) }
+}
+funcion asc(a, b) { retornar a - b }
+
+funcion modo_carga() {
+    sea trabajadores = valor(CFG, "trabajadores", 0)
+    si (trabajadores <= 0) { trabajadores = maximo(1, valor(CFG, "usuarios", 0)) }
+    si (valor(CFG, "tasa", 0) > 0 y valor(CFG, "trabajadores", 0) <= 0) { trabajadores = 4 }
+    si (trabajadores > 64) { trabajadores = 64 }
+    sea duracion = valor(CFG, "duracion_s", 30)
+    sea T = "/tmp/fuzzlab-web-" + tiempo_ms()
+    crear_carpeta(T)
+    sea yo = texto_recortar(sistema_comando("readlink /proc/$PPID/exe"))
+    mostrar("🔬 Fuzz Lab Web · carga · " + BASE + " · " + duracion + " s · " + trabajadores + " procesos")
+    sea partes = []
+    para i en rango(0, trabajadores) {
+        agregar(partes, comillas(yo) + " _trabajador " + comillas(ARGS[1]) + " " + i + " " + trabajadores + " " + comillas(T + "/w" + i + ".txt") + " &")
+    }
+    sea t0 = tiempo_ms()
+    sistema_comando(texto_unir(partes, " ") + " wait")
+    sea real_s = (tiempo_ms() - t0) / 1000
+
+    // Unir resultados
+    sea lat = []
+    sea estados = {}
+    sea fallas = 0
+    sea errores = 0
+    sea por_segundo = {}
+    sea errores_ejemplo = ""
+    para i en rango(0, trabajadores) {
+        sea ruta = T + "/w" + i + ".txt"
+        si (existe_archivo(ruta)) {
+            para l en texto_dividir(leer_archivo(ruta), "\n") {
+                si (longitud(l) > 0) {
+                    sea c = texto_dividir(l, " ")
+                    agregar(lat, a_numero(c[1]))
+                    estados[c[2]] = valor(estados, c[2], 0) + 1
+                    si (c[3] == "falla") { fallas += 1 }
+                    si (c[3] == "error") { errores += 1 }
+                    sea seg = a_texto(piso(a_numero(c[0]) / 1000))
+                    por_segundo[seg] = valor(por_segundo, seg, 0) + 1
+                }
+            }
+        }
+    }
+    sistema_comando("rm -rf " + comillas(T))
+    sea total = longitud(lat)
+    PETICIONES = total
+    sea orden = ordenar(lat, asc)
+    sea suma = 0
+    para x en lat { suma += x }
+    sea prom = 0
+    si (total > 0) { prom = piso(suma / total) }
+    sea tasa_real = piso(total / maximo(1, duracion))
+    sea pct_err = 0
+    si (total > 0) { pct_err = redondear((fallas + errores) * 100 / total, 2) }
+    sea res = {"p50": percentil(orden, 50), "p90": percentil(orden, 90), "p95": percentil(orden, 95), "p99": percentil(orden, 99), "max": percentil(orden, 100)}
+
+    // Umbrales (como k6): si no se cumplen, falla.
+    sea umbrales = valor(CFG, "umbrales", {})
+    para u en [["p50_ms", "p50"], ["p90_ms", "p90"], ["p95_ms", "p95"], ["p99_ms", "p99"], ["max_ms", "max"]] {
+        si (tiene_clave(umbrales, u[0])) { revisar_umbral(u[0], res[u[1]], umbrales[u[0]], verdadero) }
+    }
+    si (tiene_clave(umbrales, "errores_pct")) { revisar_umbral("errores_pct", pct_err, umbrales["errores_pct"], verdadero) }
+    si (tiene_clave(umbrales, "tasa_min")) { revisar_umbral("tasa_min", tasa_real, umbrales["tasa_min"], falso) }
+    si (errores > 0) { hallazgo("media", "Conexiones fallidas bajo carga", errores + " peticiones no obtuvieron respuesta (conexión rechazada o cortada).", "", "carga|errores") }
+    si (valor(estados, "500", 0) + valor(estados, "502", 0) + valor(estados, "503", 0) + valor(estados, "504", 0) > 0) {
+        hallazgo("alta", "Errores 5xx bajo carga", "El servidor respondió errores 5xx durante la prueba.", "", "carga|5xx")
+    }
+
+    sea filas_estado = []
+    para e en ordenar(mapa_claves(estados)) { sea nombre_e = e
+        si (e == "0") { nombre_e = "sin respuesta" }
+        agregar(filas_estado, "| " + nombre_e + " | " + estados[e] + " |") }
+    sea grafico = []
+    sea max_seg = 1
+    para s en mapa_claves(por_segundo) { max_seg = maximo(max_seg, por_segundo[s]) }
+    para s en rango(0, duracion) {
+        sea n = valor(por_segundo, a_texto(s), 0)
+        sea espacio = ""
+        si (s < 10) { espacio = " " }
+        agregar(grafico, espacio + s + "s " + texto_repetir("█", piso(n * 40 / max_seg)) + " " + n)
+    }
+    sea extra = ["## ⚡ Resultados", "", "| Medida | Valor |", "|---|---|",
+        "| Peticiones | " + total + " |", "| Tasa lograda | " + tasa_real + " por segundo |",
+        "| Latencia promedio | " + prom + " ms |", "| p50 | " + res["p50"] + " ms |", "| p90 | " + res["p90"] + " ms |",
+        "| p95 | " + res["p95"] + " ms |", "| p99 | " + res["p99"] + " ms |", "| Máxima | " + res["max"] + " ms |",
+        "| Errores | " + pct_err + " % (" + fallas + " respuestas inesperadas, " + errores + " sin respuesta) |", "",
+        "## Códigos de respuesta", "", "| Código | Cantidad |", "|---|---|"]
+    para f en filas_estado { agregar(extra, f) }
+    si (longitud(FILAS_UMBRAL) > 0) {
+        agregar(extra, "")
+        agregar(extra, "## Umbrales")
+        agregar(extra, "")
+        agregar(extra, "| Umbral | Medido | Esperado | |")
+        agregar(extra, "|---|---|---|---|")
+        para f en FILAS_UMBRAL { agregar(extra, f) }
+    }
+    agregar(extra, "")
+    agregar(extra, "## Peticiones por segundo")
+    agregar(extra, "")
+    agregar(extra, "```")
+    para g en grafico { agregar(extra, g) }
+    agregar(extra, "```")
+    mostrar("  " + total + " peticiones · " + tasa_real + "/s · p50 " + res["p50"] + " ms · p95 " + res["p95"] + " ms · p99 " + res["p99"] + " ms · errores " + pct_err + " %")
+    escribir_reporte("Fuzz Lab Web · carga · " + BASE, ["**Escenario:** " + longitud(escenario()) + " pasos", "**Duración:** " + duracion + " s con " + trabajadores + " procesos"], extra)
+    salir_segun(hay_graves())
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// API — ataca cada endpoint de un OpenAPI (como schemathesis)
+// ═════════════════════════════════════════════════════════════════════
+//   "url": "http://127.0.0.1:8080",
+//   "openapi": "openapi.json" o "http://127.0.0.1:8080/openapi.json",
+//   "casos_por_endpoint": 60,
+//   "limite_ms": 2000
+
+sea SPEC = {}
+
+funcion resolver(esquema) {
+    si (esquema == nulo) { retornar {} }
+    si (tiene_clave(esquema, "$ref")) {
+        sea partes = texto_dividir(esquema["$ref"], "/")
+        sea nodo = SPEC
+        para p en partes { si (p != "#" y nodo != nulo y tiene_clave(nodo, p)) { nodo = nodo[p] } }
+        retornar nodo
+    }
+    retornar esquema
+}
+
+sea TEXTOS_HOSTILES = ["", " ", "'", "\"", "' OR '1'='1", "\\", "%00", "../../../../etc/passwd", "<script>alert(1)</script>",
+    "${7*7}", "{{7*7}}", texto_repetir("A", 10000), "ñ🔥\u0000", "null", "true", "-1", "1e999", "0x41", ";fl_canario_cmd;"]
+sea NUMEROS_HOSTILES = [0, -1, 1, 2147483647, -2147483648, 9223372036854775807, 99999999999999999999, 0.5, -0.0001, 1e308]
+
+// Genera un valor para un esquema. modo: "valido", "limite" o "invalido".
+funcion generar(esquema, modo, profundidad) {
+    sea e = resolver(esquema)
+    sea tipo = valor(e, "type", "")
+    si (tipo == "" y tiene_clave(e, "properties")) { tipo = "object" }
+    si (tiene_clave(e, "enum") y modo != "invalido") { retornar elegir(e["enum"]) }
+    si (tiene_clave(e, "example") y modo == "valido" y azar(2) == 0) { retornar e["example"] }
+    si (modo == "invalido" y azar(3) == 0) {
+        // Tipo equivocado a propósito
+        si (tipo == "integer" o tipo == "number") { retornar elegir(["abc", "", nulo, [1], {"a": 1}]) }
+        si (tipo == "string") { retornar elegir([123, nulo, falso, [], {}]) }
+        si (tipo == "object") { retornar elegir(["texto", 1, [], nulo]) }
+        si (tipo == "array") { retornar elegir(["texto", 1, {}, nulo]) }
+        si (tipo == "boolean") { retornar elegir(["si", 2, nulo]) }
+    }
+    si (tipo == "integer" o tipo == "number") {
+        sea mn = valor(e, "minimum", -1000)
+        sea mx = valor(e, "maximum", 1000)
+        si (modo == "limite") { retornar elegir([mn, mx, mn - 1, mx + 1, 0]) }
+        si (modo == "invalido") { retornar elegir(NUMEROS_HOSTILES) }
+        sea n = mn + azar(maximo(1, mx - mn + 1))
+        si (tipo == "number" y azar(2) == 0) { retornar n + 0.5 }
+        retornar n
+    }
+    si (tipo == "boolean") { retornar azar(2) == 0 }
+    si (tipo == "array") {
+        si (profundidad > 4) { retornar [] }
+        sea n = azar(3)
+        si (modo == "limite") { n = elegir([0, valor(e, "maxItems", 50), valor(e, "maxItems", 50) + 1]) }
+        sea l = []
+        para i en rango(0, minimo(n, 200)) { agregar(l, generar(valor(e, "items", {}), modo, profundidad + 1)) }
+        retornar l
+    }
+    si (tipo == "object") {
+        si (profundidad > 4) { retornar {} }
+        sea o = {}
+        sea props = valor(e, "properties", {})
+        sea requeridos = valor(e, "required", [])
+        para k en mapa_claves(props) {
+            sea es_req = contiene(requeridos, k)
+            si (es_req o azar(2) == 0) { o[k] = generar(props[k], modo, profundidad + 1) }
+            si (es_req y modo == "invalido" y azar(4) == 0) { o[k] = nulo }
+        }
+        si (modo == "invalido" y azar(3) == 0) { o["__fl_extra"] = elegir(TEXTOS_HOSTILES) }
+        retornar o
+    }
+    // texto
+    sea formato = valor(e, "format", "")
+    si (modo == "valido") {
+        si (formato == "email") { retornar "fl" + azar(10000) + "@ejemplo.cl" }
+        si (formato == "uuid") { retornar "123e4567-e89b-42d3-a456-" + (100000000000 + azar(899999999999)) }
+        si (formato == "date") { retornar "2026-0" + (1 + azar(9)) + "-1" + azar(10) }
+        si (formato == "date-time") { retornar "2026-11-25T10:00:00Z" }
+        sea largo = maximo(valor(e, "minLength", 1), minimo(valor(e, "maxLength", 12), 12))
+        retornar texto_repetir(elegir(["a", "b", "z", "ñ"]), maximo(1, largo))
+    }
+    si (modo == "limite") {
+        retornar elegir(["", texto_repetir("a", valor(e, "maxLength", 255)), texto_repetir("a", valor(e, "maxLength", 255) + 1), texto_repetir("a", maximo(0, valor(e, "minLength", 0) - 1))])
+    }
+    retornar elegir(TEXTOS_HOSTILES)
+}
+
+funcion documentados(op) {
+    sea l = []
+    para k en mapa_claves(valor(op, "responses", {})) { agregar(l, a_texto(k)) }
+    retornar l
+}
+
+funcion modo_api() {
+    sea fuente = valor(CFG, "openapi", "")
+    si (fuente == "") { mostrar("Falta \"openapi\" (archivo o URL)") salir(2) }
+    si (empieza(fuente, "http")) { SPEC = cfv_json_parsear(pedir("GET", fuente, "", nulo)["cuerpo"]) } sino { SPEC = cfv_json_parsear(leer_archivo(fuente)) }
+    si (BASE == "" y tiene_clave(SPEC, "servers")) { BASE = SPEC["servers"][0]["url"] }
+    si (no autorizado(BASE)) { mostrar("🔒 " + host_de(BASE) + " no está autorizado.") salir(3) }
+    sea casos = valor(CFG, "casos_por_endpoint", 60)
+    sea limite_ms = valor(CFG, "limite_ms", 2000)
+    sea n_ops = 0
+    sea por_endpoint = []
+    mostrar("🔬 Fuzz Lab Web · api · " + valor(valor(SPEC, "info", {}), "title", "API") + " · " + BASE)
+    para ruta en mapa_claves(valor(SPEC, "paths", {})) {
+        sea item = SPEC["paths"][ruta]
+        para metodo en ["get", "post", "put", "patch", "delete"] {
+            si (tiene_clave(item, metodo)) {
+                n_ops += 1
+                sea op = item[metodo]
+                sea params = []
+                para p en valor(item, "parameters", []) { agregar(params, resolver(p)) }
+                para p en valor(op, "parameters", []) { agregar(params, resolver(p)) }
+                sea cuerpo_esq = nulo
+                si (tiene_clave(op, "requestBody")) {
+                    sea rb = resolver(op["requestBody"])
+                    sea cont = valor(rb, "content", {})
+                    si (tiene_clave(cont, "application/json")) { cuerpo_esq = valor(cont["application/json"], "schema", {}) }
+                }
+                sea docs = documentados(op)
+                sea c5xx = 0
+                sea lentas = 0
+                para i en rango(0, casos) {
+                    sea modo = "valido"
+                    si (i % 3 == 1) { modo = "limite" }
+                    si (i % 3 == 2) { modo = "invalido" }
+                    sea camino = ruta
+                    sea query = []
+                    sea cab = {}
+                    para p en params {
+                        sea v = generar(valor(p, "schema", {}), modo, 0)
+                        sea donde = valor(p, "in", "query")
+                        si (donde == "path") { camino = texto_reemplazar(camino, "{" + p["name"] + "}", codificar(v)) }
+                        si (donde == "query" y (valor(p, "required", falso) o azar(2) == 0)) { agregar(query, codificar(p["name"]) + "=" + codificar(v)) }
+                        si (donde == "header") { cab[p["name"]] = a_texto(v) }
+                    }
+                    sea url = unir_url(BASE, camino)
+                    si (longitud(query) > 0) { url = url + "?" + texto_unir(query, "&") }
+                    sea cuerpo = ""
+                    si (cuerpo_esq != nulo) {
+                        intentar { cuerpo = json_serializar(generar(cuerpo_esq, modo, 0)) } capturar (e) { cuerpo = "{\"__fl\": 99999999999999999999999}" }
+                        cab["Content-Type"] = "application/json"
+                    }
+                    pausar()
+                    sea r = pedir(texto_mayusculas(metodo), url, cuerpo, cab)
+                    sea rep = curl(texto_mayusculas(metodo), url, cuerpo, cab)
+                    sea nombre = texto_mayusculas(metodo) + " " + ruta
+                    si (r["error"] != "") {
+                        hallazgo("alta", nombre + ": el servidor cortó la conexión sin responder", "Con datos de tipo **" + modo + "** el servidor no devolvió respuesta (" + r["error"] + "): suele ser un error interno sin manejar.", rep, "caida|" + nombre)
+                    } sino {
+                        sea est = a_texto(r["estado"])
+                        si (r["estado"] >= 500) {
+                            c5xx += 1
+                            sea traza = ""
+                            para pista en ["Traceback", "Exception", "at java.", "stack", "SQLSTATE", "OperationalError", "panic"] {
+                                si (contiene_t(r["cuerpo"], pista)) { traza = " La respuesta además muestra detalles internos (" + pista + ")." }
+                            }
+                            hallazgo("alta", nombre + ": error " + est + " del servidor", "Con datos de tipo **" + modo + "** el endpoint respondió " + est + "." + traza, rep, "5xx|" + nombre + "|" + modo)
+                        } sino {
+                            si (longitud(docs) > 0 y no contiene(docs, est) y no contiene(docs, "default") y no contiene(docs, subtexto(est, 0, 1) + "XX")) {
+                                hallazgo("baja", nombre + ": respuesta " + est + " no documentada", "El OpenAPI documenta " + texto_unir(docs, ", ") + ".", rep, "nodoc|" + nombre + "|" + est)
+                            }
+                            si (modo == "invalido" y r["estado"] >= 200 y r["estado"] < 300 y (cuerpo != "" o longitud(params) > 0)) {
+                                hallazgo("media", nombre + ": acepta datos inválidos", "Respondió " + est + " a una petición con datos de tipo o formato incorrecto: falta validación.", rep, "acepta|" + nombre)
+                            }
+                            si (contiene_t(minus(cabecera(r, "content-type")), "json") y r["cuerpo"] != "") {
+                                intentar { cfv_json_parsear(r["cuerpo"]) } capturar (e) { hallazgo("media", nombre + ": JSON inválido en la respuesta", "Dice ser JSON pero no se puede leer.", rep, "json|" + nombre) }
+                            }
+                        }
+                        si (r["ms"] > limite_ms) {
+                            lentas += 1
+                            hallazgo("media", nombre + ": respuesta lenta", "Tardó " + r["ms"] + " ms (límite " + limite_ms + " ms) con datos de tipo " + modo + ". Revisa si un dato puede trabar el servidor (ReDoS, consultas sin límite).", rep, "lenta|" + nombre)
+                        }
+                    }
+                }
+                agregar(por_endpoint, "| " + texto_mayusculas(metodo) + " `" + ruta + "` | " + casos + " | " + c5xx + " | " + lentas + " |")
+            }
+        }
+    }
+    sea extra = ["## Endpoints", "", "| Endpoint | Casos | Errores 5xx | Lentas |", "|---|---|---|---|"]
+    para f en por_endpoint { agregar(extra, f) }
+    escribir_reporte("Fuzz Lab Web · api · " + BASE, ["**Endpoints:** " + n_ops, "**Casos:** " + PETICIONES + " (válidos, límite e inválidos)"], extra)
+    salir_segun(hay_graves())
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// RUTAS — archivos expuestos y FUZZ en la URL (como ffuf)
+// ═════════════════════════════════════════════════════════════════════
+//   "url": "http://127.0.0.1:8080",
+//   "palabras": ["admin", "api"],          o "lista": "palabras.txt"
+//   "fuzz": "http://127.0.0.1:8080/api/FUZZ?id=1"   (opcional: FUZZ se reemplaza)
+
+// [ruta, severidad, qué es, texto que confirma (opcional)]
+sea SENSIBLES = [
+    [".env", "crítica", "variables de entorno (claves y contraseñas)", "="],
+    [".env.local", "crítica", "variables de entorno", "="], [".env.production", "crítica", "variables de entorno de producción", "="],
+    [".git/config", "crítica", "repositorio git expuesto (se puede bajar todo el código)", "[core]"],
+    [".git/HEAD", "crítica", "repositorio git expuesto", "ref:"], [".svn/entries", "alta", "repositorio SVN expuesto", ""],
+    [".hg/hgrc", "alta", "repositorio Mercurial expuesto", ""], [".DS_Store", "baja", "listado de archivos de macOS", ""],
+    ["backup.zip", "alta", "respaldo comprimido", ""], ["backup.sql", "crítica", "respaldo de base de datos", "INSERT"],
+    ["dump.sql", "crítica", "respaldo de base de datos", "INSERT"], ["db.sqlite", "crítica", "base de datos SQLite", "SQLite"],
+    ["database.sql", "crítica", "respaldo de base de datos", ""], ["config.php.bak", "alta", "copia de configuración", ""],
+    ["wp-config.php.bak", "crítica", "configuración de WordPress", "DB_PASSWORD"], ["config.json", "media", "configuración", "{"],
+    ["config.yml", "media", "configuración", ":"], ["settings.py", "alta", "configuración de Django", "SECRET_KEY"],
+    ["appsettings.json", "alta", "configuración de .NET", "{"], ["web.config", "media", "configuración de IIS", "<configuration"],
+    [".htaccess", "baja", "configuración de Apache", ""], [".htpasswd", "crítica", "contraseñas de Apache", ":"],
+    ["id_rsa", "crítica", "clave privada SSH", "PRIVATE KEY"], [".ssh/id_rsa", "crítica", "clave privada SSH", "PRIVATE KEY"],
+    [".aws/credentials", "crítica", "credenciales de AWS", "aws_access_key_id"], [".npmrc", "alta", "token de npm", "_authToken"],
+    [".dockercfg", "alta", "credenciales de Docker", "auth"], ["docker-compose.yml", "media", "configuración de Docker", "services"],
+    ["phpinfo.php", "alta", "phpinfo (muestra toda la configuración del servidor)", "PHP Version"], ["info.php", "alta", "phpinfo", "PHP Version"],
+    ["server-status", "media", "estado de Apache", "Apache"], ["actuator", "media", "Spring Boot Actuator", "_links"],
+    ["actuator/env", "crítica", "variables de Spring Boot", "propertySources"], ["actuator/heapdump", "crítica", "volcado de memoria de Java", ""],
+    ["debug", "media", "página de depuración", ""], ["console", "alta", "consola de administración", ""],
+    ["admin", "info", "panel de administración", ""], ["administrador", "info", "panel de administración", ""],
+    ["phpmyadmin/", "alta", "phpMyAdmin", "phpMyAdmin"], ["adminer.php", "alta", "Adminer (gestor de base de datos)", "Adminer"],
+    ["swagger.json", "info", "documentación de la API", "swagger"], ["openapi.json", "info", "documentación de la API", "openapi"],
+    ["api-docs", "info", "documentación de la API", ""], ["graphql", "info", "GraphQL", ""],
+    ["storage/logs/laravel.log", "alta", "registro de Laravel", "Stack trace"], ["logs/error.log", "alta", "registro de errores", ""],
+    ["error.log", "alta", "registro de errores", ""], ["npm-debug.log", "baja", "registro de npm", ""],
+    ["package.json", "baja", "dependencias del proyecto", "dependencies"], ["composer.lock", "baja", "dependencias de PHP", "packages"],
+    ["robots.txt", "info", "robots.txt (puede revelar rutas ocultas)", ""], ["sitemap.xml", "info", "mapa del sitio", ""],
+    [".well-known/security.txt", "info", "contacto de seguridad", ""], ["crossdomain.xml", "baja", "política de Flash", "allow-access-from"],
+    ["cgi-bin/", "baja", "carpeta CGI", ""], ["uploads/", "baja", "carpeta de archivos subidos", ""], ["backup/", "alta", "carpeta de respaldos", ""],
+    ["test.php", "baja", "archivo de prueba", ""], ["old/", "baja", "versión antigua del sitio", ""], ["dev/", "media", "entorno de desarrollo", ""],
+    ["staging/", "media", "entorno de pruebas", ""], [".vscode/settings.json", "baja", "configuración del editor", "{"],
+    [".idea/workspace.xml", "baja", "configuración del editor", "<project"], ["Dockerfile", "baja", "Dockerfile", "FROM"],
+    [".gitlab-ci.yml", "baja", "CI de GitLab", ""], [".github/workflows/", "baja", "CI de GitHub", ""], ["firebase.json", "baja", "configuración de Firebase", "{"],
+    ["credentials.json", "crítica", "credenciales", "{"], ["secrets.json", "crítica", "secretos", "{"], ["key.pem", "crítica", "clave privada", "PRIVATE KEY"],
+    ["server.key", "crítica", "clave privada del servidor", "PRIVATE KEY"], ["trace.axd", "media", "trazas de ASP.NET", ""], ["elmah.axd", "alta", "errores de ASP.NET", ""]
+]
+
+// Respuesta "no encontrado" del sitio (para no confundir un 200 genérico
+// con un archivo real; ffuf lo llama autocalibración).
+funcion huella_404() {
+    sea r = pedir("GET", unir_url(BASE, "/fl-no-existe-" + tiempo_ms() + ".txt"), "", nulo)
+    sea r2 = pedir("GET", unir_url(BASE, "/fl-otra-" + azar(999999)), "", nulo)
+    retornar {"estado": r["estado"], "cuerpo": r["cuerpo"], "cuerpo2": r2["cuerpo"]}
+}
+
+// ¿La respuesta es la página "no existe" del sitio, aunque venga con 200?
+funcion parece_404(r, h, ruta) {
+    si (r["estado"] == 404 o r["estado"] == 0) { retornar verdadero }
+    si (r["estado"] != h["estado"]) { retornar falso }
+    sea c = texto_reemplazar(r["cuerpo"], ruta, "")
+    si (c == h["cuerpo"] o c == h["cuerpo2"] o r["cuerpo"] == h["cuerpo"]) { retornar verdadero }
+    sea ancho = minimo(64, minimo(longitud(c), longitud(h["cuerpo"])))
+    si (absoluto(longitud(c) - longitud(h["cuerpo"])) <= 8 y subtexto(c, 0, ancho) == subtexto(h["cuerpo"], 0, ancho)) { retornar verdadero }
+    retornar falso
+}
+
+funcion modo_rutas() {
+    mostrar("🔬 Fuzz Lab Web · rutas · " + BASE)
+    sea h = huella_404()
+    sea encontradas = []
+    para s en SENSIBLES {
+        pausar()
+        sea url = unir_url(BASE, s[0])
+        sea r = pedir("GET", url, "", nulo)
+        si (no parece_404(r, h, s[0]) y r["estado"] < 400) {
+            sea confirmado = s[3] == "" o contiene_t(r["cuerpo"], s[3])
+            si (confirmado) {
+                agregar(encontradas, "| " + r["estado"] + " | `/" + s[0] + "` | " + longitud(r["cuerpo"]) + " B | " + s[2] + " |")
+                hallazgo(s[1], "Expuesto: /" + s[0], s[2] + " responde " + r["estado"] + " (" + longitud(r["cuerpo"]) + " bytes).", "curl -i " + comillas(url), "ruta|" + s[0])
+            }
+        }
+        si (r["estado"] == 403 y s[1] == "crítica") {
+            agregar(encontradas, "| 403 | `/" + s[0] + "` | — | existe pero está protegido |")
+        }
+    }
+    // Palabras propias y FUZZ
+    sea palabras = valor(CFG, "palabras", [])
+    si (tiene_clave(CFG, "lista")) { para l en texto_dividir(leer_archivo(CFG["lista"]), "\n") { si (texto_recortar(l) != "") { agregar(palabras, texto_recortar(l)) } } }
+    sea plantilla = valor(CFG, "fuzz", "")
+    si (plantilla == "" y longitud(palabras) > 0) { plantilla = unir_url(BASE, "/FUZZ") }
+    si (plantilla != "") {
+        sea base_r = pedir("GET", texto_reemplazar(plantilla, "FUZZ", "fl" + azar(99999999)), "", nulo)
+        para p en palabras {
+            pausar()
+            sea url = texto_reemplazar(plantilla, "FUZZ", cfv_url_codificar(p))
+            sea r = pedir("GET", url, "", nulo)
+            si (r["estado"] != base_r["estado"] o absoluto(longitud(r["cuerpo"]) - longitud(base_r["cuerpo"])) > 32) {
+                agregar(encontradas, "| " + r["estado"] + " | `" + p + "` | " + longitud(r["cuerpo"]) + " B | distinta a la base (" + base_r["estado"] + ", " + longitud(base_r["cuerpo"]) + " B) |")
+                si (r["estado"] >= 500) { hallazgo("media", "Error " + r["estado"] + " con FUZZ = " + p, "La palabra provoca un error del servidor.", "curl -i " + comillas(url), "fuzz5xx|" + p) }
+            }
+        }
+    }
+    sea extra = ["## Rutas que responden", "", "| Código | Ruta / palabra | Tamaño | Nota |", "|---|---|---|---|"]
+    para f en encontradas { agregar(extra, f) }
+    escribir_reporte("Fuzz Lab Web · rutas · " + BASE, ["**Rutas sensibles probadas:** " + longitud(SENSIBLES), "**Palabras propias:** " + longitud(palabras), "**Respuesta \"no existe\" del sitio:** " + h["estado"] + " (" + longitud(h["cuerpo"]) + " bytes)"], extra)
+    salir_segun(hay_graves())
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// REVISAR — plantillas de seguridad (como nuclei / ZAP baseline)
+// ═════════════════════════════════════════════════════════════════════
+//   "url": "http://127.0.0.1:8080",
+//   "paginas": ["/", "/buscar?q=hola", "/ir?next=/inicio"],
+//   "plantillas": "mis-plantillas/"   carpeta con .json propios (opcional)
+//
+// Plantilla propia (.json):
+//   {"id": "panel-viejo", "severidad": "alta", "titulo": "Panel antiguo expuesto",
+//    "metodo": "GET", "ruta": "/admin-viejo", "cabeceras": {},
+//    "coincide": {"estado": 200, "cuerpo": ["Panel"], "cabecera": {"server": "Apache/2.2"}}}
+
+sea CANARIO = "fl7c4n4r10"
+
+funcion revisar_cabeceras(url, r) {
+    sea https = empieza(url, "https://")
+    sea faltan = []
+    si (cabecera(r, "content-security-policy") == "") { agregar(faltan, "Content-Security-Policy (frena XSS)") }
+    si (cabecera(r, "x-content-type-options") == "") { agregar(faltan, "X-Content-Type-Options: nosniff") }
+    si (cabecera(r, "x-frame-options") == "" y no contiene_t(cabecera(r, "content-security-policy"), "frame-ancestors")) { agregar(faltan, "X-Frame-Options o frame-ancestors (clickjacking)") }
+    si (cabecera(r, "referrer-policy") == "") { agregar(faltan, "Referrer-Policy") }
+    si (https y cabecera(r, "strict-transport-security") == "") { agregar(faltan, "Strict-Transport-Security (HSTS)") }
+    si (longitud(faltan) > 0) { hallazgo("baja", "Faltan cabeceras de seguridad", "En " + url + ": " + texto_unir(faltan, " · ") + ".", "curl -sI " + comillas(url), "cabeceras") }
+    sea server = cabecera(r, "server")
+    para v en [cabecera(r, "x-powered-by"), server, cabecera(r, "x-aspnet-version")] {
+        si (v != "" y texto_indice(v, "/") >= 0) {
+            sea tiene_numero = falso
+            para d en ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"] { si (contiene_t(v, d)) { tiene_numero = verdadero } }
+            si (tiene_numero) { hallazgo("baja", "El servidor revela su versión", "Cabecera con \"" + v + "\": ayuda a buscar vulnerabilidades conocidas de esa versión.", "curl -sI " + comillas(url), "version|" + v) }
+        }
+    }
+    // Cookies
+    para ck en [cabecera(r, "set-cookie")] {
+        para linea en texto_dividir(ck, "\n") {
+            sea l = minus(linea)
+            si (texto_recortar(l) != "") {
+                sea nombre_ck = texto_dividir(texto_recortar(linea), "=")[0]
+                sea problemas = []
+                si (no contiene_t(l, "httponly")) { agregar(problemas, "sin HttpOnly (un script la puede leer)") }
+                si (https y no contiene_t(l, "secure")) { agregar(problemas, "sin Secure") }
+                si (no contiene_t(l, "samesite")) { agregar(problemas, "sin SameSite (CSRF)") }
+                si (longitud(problemas) > 0) { hallazgo("media", "Cookie insegura: " + nombre_ck, texto_unir(problemas, " · ") + ".", "curl -sI " + comillas(url), "cookie|" + nombre_ck) }
+            }
+        }
+    }
+}
+
+funcion params_de(url) {
+    sea q = texto_indice(url, "?")
+    si (q < 0) { retornar [] }
+    sea l = []
+    para par en texto_dividir(subtexto(url, q + 1, longitud(url)), "&") {
+        sea kv = texto_dividir(par, "=")
+        si (kv[0] != "") { agregar(l, kv[0]) }
+    }
+    retornar l
+}
+
+funcion con_param(url, nombre, valor_nuevo) {
+    sea q = texto_indice(url, "?")
+    sea base = subtexto(url, 0, q)
+    sea partes = []
+    para par en texto_dividir(subtexto(url, q + 1, longitud(url)), "&") {
+        sea kv = texto_dividir(par, "=")
+        si (kv[0] == nombre) { agregar(partes, nombre + "=" + cfv_url_codificar(valor_nuevo)) } sino { agregar(partes, par) }
+    }
+    retornar base + "?" + texto_unir(partes, "&")
+}
+
+funcion revisar_parametros(url) {
+    para p en params_de(url) {
+        // XSS reflejado: el canario con < y " vuelve sin escapar.
+        pausar()
+        sea u = con_param(url, p, CANARIO + "<b\"'>")
+        sea r = pedir("GET", u, "", nulo)
+        si (contiene_t(r["cuerpo"], CANARIO + "<b\"") y contiene_t(minus(cabecera(r, "content-type")), "html")) {
+            hallazgo("alta", "XSS reflejado en el parámetro \"" + p + "\"", "Lo que llega en \"" + p + "\" vuelve en el HTML sin escapar: un atacante puede ejecutar JavaScript en el navegador de otra persona.", "curl -s " + comillas(u), "xss|" + p)
+        }
+        // Errores SQL con una comilla
+        pausar()
+        sea u2 = con_param(url, p, "1'\"" + CANARIO)
+        sea r2 = pedir("GET", u2, "", nulo)
+        para pista en ["SQL syntax", "SQLSTATE", "OperationalError", "sqlite3", "ORA-0", "unterminated quoted", "pg_query", "mysql_fetch", "Unclosed quotation"] {
+            si (contiene_t(r2["cuerpo"], pista)) {
+                hallazgo("crítica", "Posible inyección SQL en \"" + p + "\"", "Una comilla en \"" + p + "\" provoca un error de base de datos (" + pista + "): el valor llega armado dentro de la consulta.", "curl -s " + comillas(u2), "sql|" + p)
+            }
+        }
+        // Redirección abierta
+        si (contiene(["next", "url", "redirect", "redirect_uri", "return", "returnto", "volver", "destino", "ir", "continue", "goto", "r"], minus(p))) {
+            pausar()
+            sea u3 = con_param(url, p, "https://" + CANARIO + ".ejemplo.org/")
+            sea r3 = pedir("GET", u3, "", nulo)
+            si (r3["estado"] >= 300 y r3["estado"] < 400 y contiene_t(cabecera(r3, "location"), CANARIO)) {
+                hallazgo("media", "Redirección abierta en \"" + p + "\"", "El sitio redirige a cualquier dominio que venga en \"" + p + "\" (útil para phishing).", "curl -sI " + comillas(u3), "redir|" + p)
+            }
+        }
+        // Plantillas en el servidor (SSTI)
+        pausar()
+        sea u4 = con_param(url, p, CANARIO + "{{7*191}}${7*191}")
+        sea r4 = pedir("GET", u4, "", nulo)
+        si (contiene_t(r4["cuerpo"], CANARIO + "1337") ) {
+            hallazgo("crítica", "Inyección de plantillas (SSTI) en \"" + p + "\"", "El servidor evaluó una expresión que venía en \"" + p + "\" (7×191 = 1337): suele permitir ejecutar código.", "curl -s " + comillas(u4), "ssti|" + p)
+        }
+        // Recorrido de rutas
+        pausar()
+        sea u5 = con_param(url, p, "../../../../../../etc/passwd")
+        sea r5 = pedir("GET", u5, "", nulo)
+        si (contiene_t(r5["cuerpo"], "root:x:0:0") o contiene_t(r5["cuerpo"], "root:*:0:0")) {
+            hallazgo("crítica", "Recorrido de rutas en \"" + p + "\"", "Con \"../\" en \"" + p + "\" el servidor devolvió /etc/passwd: se puede leer cualquier archivo.", "curl -s " + comillas(u5), "ruta|" + p)
+        }
+    }
+}
+
+funcion revisar_cors(url) {
+    pausar()
+    sea r = pedir("GET", url, "", {"Origin": "https://" + CANARIO + ".ejemplo.org"})
+    sea acao = cabecera(r, "access-control-allow-origin")
+    sea cred = minus(cabecera(r, "access-control-allow-credentials")) == "true"
+    si (contiene_t(acao, CANARIO) y cred) {
+        hallazgo("alta", "CORS acepta cualquier origen con credenciales", "Cualquier sitio puede leer respuestas con la sesión del usuario (refleja el Origin y permite credenciales).", "curl -sI -H 'Origin: https://evil.ejemplo.org' " + comillas(url), "cors")
+    } sino {
+        si (acao == "*" y cred) { hallazgo("media", "CORS: * con credenciales", "Configuración contradictoria de CORS.", "curl -sI " + comillas(url), "cors*") }
+    }
+}
+
+funcion revisar_varios(url) {
+    pausar()
+    sea r = pedir("TRACE", url, "", {"X-Fl-Canario": CANARIO})
+    si (r["estado"] == 200 y contiene_t(r["cuerpo"], CANARIO)) { hallazgo("baja", "Método TRACE activado", "Puede ayudar a robar cookies (Cross-Site Tracing).", "curl -i -X TRACE " + comillas(url), "trace") }
+    pausar()
+    sea r2 = pedir("GET", url, "", nulo)
+    si (contiene_t(r2["cuerpo"], "Index of /") o contiene_t(r2["cuerpo"], "Directory listing for")) { hallazgo("media", "Listado de carpetas activado", url + " muestra la lista de archivos de la carpeta.", "curl -s " + comillas(url), "listado|" + url) }
+    para pista en ["Traceback (most recent call last)", "Stack trace:", "at java.", "Warning</b>:", "Fatal error</b>:", "DEBUG = True", "Whoops! There was an error", "Exception Details"] {
+        si (contiene_t(r2["cuerpo"], pista)) { hallazgo("media", "Errores internos visibles", url + " muestra detalles internos (" + pista + ").", "curl -s " + comillas(url), "traza|" + pista) }
+    }
+    si (empieza(url, "http://") y no contiene(["127.0.0.1", "localhost", "::1"], host_de(url))) {
+        hallazgo("media", "Sitio sin HTTPS", url + " se sirve sin cifrado.", "", "http")
+    }
+}
+
+funcion coincide_plantilla(p, r) {
+    sea c = valor(p, "coincide", {})
+    si (tiene_clave(c, "estado") y r["estado"] != c["estado"]) { retornar falso }
+    para t en valor(c, "cuerpo", []) { si (no contiene_t(r["cuerpo"], t)) { retornar falso } }
+    para t en valor(c, "no_cuerpo", []) { si (contiene_t(r["cuerpo"], t)) { retornar falso } }
+    sea cab = valor(c, "cabecera", {})
+    para k en mapa_claves(cab) { si (no contiene_t(minus(cabecera(r, k)), minus(cab[k]))) { retornar falso } }
+    retornar verdadero
+}
+
+funcion modo_revisar() {
+    mostrar("🔬 Fuzz Lab Web · revisar · " + BASE)
+    sea paginas = valor(CFG, "paginas", ["/"])
+    sea primera = verdadero
+    para pg en paginas {
+        sea url = unir_url(BASE, pg)
+        pausar()
+        sea r = pedir("GET", url, "", nulo)
+        si (r["error"] != "") {
+            hallazgo("info", "No responde: " + url, r["error"], "", "noresp|" + url)
+        } sino {
+            si (primera) {
+                revisar_cabeceras(url, r)
+                revisar_cors(url)
+                primera = falso
+            } sino { revisar_cabeceras(url, r) }
+            revisar_varios(url)
+            revisar_parametros(url)
+        }
+    }
+    // Plantillas propias
+    sea n_plantillas = 0
+    sea carpeta = valor(CFG, "plantillas", "")
+    si (carpeta != "" y existe_archivo(carpeta)) {
+        para f en listar_carpeta(carpeta) {
+            si (termina(f, ".json")) {
+                sea p = cfv_json_parsear(leer_archivo(carpeta + "/" + f))
+                n_plantillas += 1
+                pausar()
+                sea url = unir_url(BASE, valor(p, "ruta", "/"))
+                sea r = pedir(valor(p, "metodo", "GET"), url, valor(p, "cuerpo", ""), valor(p, "cabeceras", nulo))
+                si (coincide_plantilla(p, r)) {
+                    hallazgo(valor(p, "severidad", "media"), valor(p, "titulo", valor(p, "id", f)), valor(p, "descripcion", "La plantilla " + valor(p, "id", f) + " coincidió en " + url + "."), curl(valor(p, "metodo", "GET"), url, valor(p, "cuerpo", ""), valor(p, "cabeceras", nulo)), "plantilla|" + f)
+                }
+            }
+        }
+    }
+    escribir_reporte("Fuzz Lab Web · revisar · " + BASE, ["**Páginas:** " + longitud(paginas), "**Plantillas propias:** " + n_plantillas, "**Revisiones incluidas:** cabeceras de seguridad, versión del servidor, cookies, CORS, XSS reflejado, inyección SQL, redirección abierta, SSTI, recorrido de rutas, TRACE, listado de carpetas, errores visibles, HTTPS"], [])
+    salir_segun(hay_graves())
+}
+
+// ── Inicio ──────────────────────────────────────────────────────────────
+
+si (MODO == "carga") { modo_carga() }
+sino si (MODO == "api") { modo_api() }
+sino si (MODO == "rutas") { modo_rutas() }
+sino si (MODO == "revisar") { modo_revisar() }
+sino {
+    mostrar("Modo desconocido: " + MODO + " (usa carga, api, rutas o revisar)")
+    salir(2)
+}

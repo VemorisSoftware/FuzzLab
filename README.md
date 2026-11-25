@@ -6,6 +6,8 @@ Laboratorio de ataques automáticos de Vemoris. Bombardea nuestros proyectos con
 
 ## Objetivos
 
+**Fuzz Lab Web** ([`web/`](web/README.md)) pone a prueba sitios y APIs: carga, OpenAPI, rutas expuestas y plantillas de seguridad.
+
 **Fuzz Lab Universal** ([`universal/`](universal/README.md)) ataca cualquier programa en cualquier lenguaje, con cobertura real, diccionario automático, inyección dirigida y reducción de fallas.
 
 

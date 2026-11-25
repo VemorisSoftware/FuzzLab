@@ -1,0 +1,1 @@
+{"url": "http://127.0.0.1:8790", "paginas": ["/", "/buscar?q=hola", "/usuario?id=1", "/ir?next=/", "/archivo?nombre=x.txt"], "salida": "salida-web-revisar", "tasa_maxima": 100}
