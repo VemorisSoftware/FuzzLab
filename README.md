@@ -1,5 +1,7 @@
 # 🔬 Fuzz Lab · Vemoris Software
 
+> ⚠️ **Software propietario.** El código es visible solo por transparencia. Usar, ejecutar, copiar o modificar Fuzz Lab requiere **permiso previo y por escrito** de Vemoris Software. Ver [LICENSE](LICENSE).
+
 Laboratorio de ataques automáticos de Vemoris. Bombardea nuestros proyectos con miles de entradas hostiles, día y noche, para encontrar cierres, cuelgues y errores antes que nadie. No usa IA: es fuerza bruta, y no cuesta nada.
 
 ## Objetivos
@@ -27,7 +29,13 @@ Una **falla** es un cierre por señal (segfault, abort, sin memoria), un cuelgue
 
 **Para pararlo:** Settings → Secrets and variables → Actions → Variables → `FUZZ_LAB_ACTIVO` = `no`.
 
-## Correrlo a mano
+## Licencia y permisos
+
+Fuzz Lab **no es de código abierto**. Las empresas que quieran auditar sus productos o su código con Fuzz Lab deben solicitar una licencia a Vemoris Software: **contacto@vemoris.cl**.
+
+Aun con permiso, solo se puede usar contra sistemas propios o con autorización expresa de su dueño. Atacar sistemas de terceros sin autorización está prohibido.
+
+## Correrlo a mano (solo con autorización)
 
 ```sh
 git clone https://github.com/VemorisSoftware/cforge && make -C cforge build

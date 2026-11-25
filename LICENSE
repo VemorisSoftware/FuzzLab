@@ -1,0 +1,69 @@
+LICENCIA FUZZ LAB — VEMORIS SOFTWARE
+Copyright (c) 2026 Vemoris Software. Todos los derechos reservados.
+
+Fuzz Lab (el "Software") es propiedad de Vemoris Software. Su código es
+visible públicamente solo para transparencia. NO es software libre ni de
+código abierto.
+
+1. LO QUE ESTÁ PERMITIDO SIN PERMISO
+   Ver y leer el código en GitHub.
+
+2. LO QUE REQUIERE PERMISO PREVIO Y POR ESCRITO DE VEMORIS SOFTWARE
+   a) Ejecutar, instalar o usar el Software, en todo o en parte.
+   b) Usarlo contra cualquier programa, producto, servicio o sistema,
+      propio o de terceros.
+   c) Copiarlo, modificarlo, adaptarlo, traducirlo o crear obras
+      derivadas.
+   d) Distribuirlo, publicarlo, venderlo, sublicenciarlo u ofrecerlo
+      como servicio.
+   e) Usar sus técnicas, ataques o generadores en otras herramientas.
+   f) Usar el nombre "Fuzz Lab" o las marcas de Vemoris.
+
+3. USO RESPONSABLE
+   Aun con permiso, el Software solo puede usarse contra sistemas propios
+   o contra sistemas cuyo dueño haya dado autorización expresa. Queda
+   prohibido usarlo para atacar, interrumpir, saturar o dañar sistemas de
+   terceros sin autorización. El incumplimiento termina de inmediato
+   cualquier permiso otorgado.
+
+4. PERMISOS PARA EMPRESAS
+   Las empresas que quieran auditar sus productos o código con Fuzz Lab
+   deben solicitar una licencia a Vemoris Software, indicando la empresa,
+   el producto a auditar y el uso previsto. Vemoris Software puede
+   aceptar, condicionar o rechazar cada solicitud.
+
+   Solicitudes: contacto@vemoris.cl
+
+5. SIN GARANTÍA
+   El Software se entrega "tal cual", sin garantías de ningún tipo.
+   Vemoris Software no responde por daños derivados de su uso, incluido
+   el uso no autorizado.
+
+6. Cualquier derecho no otorgado expresamente en esta licencia queda
+   reservado a Vemoris Software.
+
+────────────────────────────────────────────────────────────────────────
+
+FUZZ LAB LICENSE — VEMORIS SOFTWARE
+Copyright (c) 2026 Vemoris Software. All rights reserved.
+
+Fuzz Lab (the "Software") is the property of Vemoris Software. Its source
+is publicly visible for transparency only. It is NOT free or open-source
+software.
+
+1. Allowed without permission: viewing and reading the code on GitHub.
+2. Prior written permission from Vemoris Software is required to: run,
+   install or use the Software; use it against any program, product,
+   service or system; copy, modify or create derivative works; distribute,
+   publish, sell, sublicense or offer it as a service; reuse its
+   techniques, attacks or generators; or use the "Fuzz Lab" name or
+   Vemoris trademarks.
+3. Responsible use: even with permission, the Software may only be used
+   against systems you own or are expressly authorized to test. Using it
+   to attack, disrupt or damage third-party systems without authorization
+   is prohibited and immediately terminates any permission granted.
+4. Companies wishing to audit their products with Fuzz Lab must request
+   a license from Vemoris Software (contacto@vemoris.cl), stating the
+   company, the product and the intended use.
+5. The Software is provided "as is", without warranty of any kind.
+6. All rights not expressly granted are reserved by Vemoris Software.
