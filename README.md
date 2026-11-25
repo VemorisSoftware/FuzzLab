@@ -19,7 +19,7 @@ Laboratorio de ataques automáticos de Vemoris. Bombardea nuestros proyectos con
 | **mutaciones** | Programas reales de C-Forge con mutaciones, en el compilador y al ejecutar |
 | **bytes** | Bytes aleatorios al compilador |
 | **cruzadas** | Resultados incorrectos: propiedades que siempre deben cumplirse (aritmética con enteros gigantes, ordenar, textos, JSON, Base64, URL y compresores de ida y vuelta) (`cruzadas.cfv`) |
-| **rendimiento** | Velocidad de C-Forge en tareas típicas, comparada con la corrida anterior (detecta si se pone más lento) y con C `-O2` (`rendimiento.cfv`, `bench_c.c`) |
+| **rendimiento** | Velocidad de C-Forge comparada con la corrida anterior (detecta si se pone más lento) y con **C, C++, Rust, Java, C#, JavaScript y TypeScript**, con el mismo algoritmo en cada uno (`rendimiento.cfv`, `lenguajes/`) |
 | **memoria** | Fugas: repite tareas 1000 y 4000 veces y vigila que la memoria no crezca sin control (`fugas.cfv`) |
 
 Una **falla** es un cierre por señal (segfault, abort, sin memoria), un cuelgue, un error que `intentar/capturar` no atrapa, un resultado incorrecto, una regresión de velocidad o una fuga de memoria. Los errores normales de C-Forge no cuentan.

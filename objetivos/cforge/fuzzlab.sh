@@ -14,7 +14,8 @@
 #   mutaciones programas reales con mutaciones (compilador y ejecución)
 #   bytes      bytes aleatorios al compilador
 #   cruzadas   resultados incorrectos (propiedades que siempre deben cumplirse)
-#   rendimiento velocidad vs. la corrida anterior y vs. C   (una vez por corrida)
+#   rendimiento velocidad vs. la corrida anterior y vs. C, C++, Rust, Java,
+#               C#, JavaScript y TypeScript               (una vez por corrida)
 #   memoria    fugas de memoria                            (una vez por corrida)
 #
 # BASE_RENDIMIENTO (opcional): archivo con los tiempos de la corrida anterior.
@@ -98,10 +99,7 @@ if [ "$codigo" -ne 0 ]; then
     tipo=$(tipo_de "$codigo"); [ -z "$tipo" ] && tipo="error"
     registrar "rendimiento|$tipo" rendimiento "$tipo en las pruebas de velocidad" "rendimiento.cfv terminó con código $codigo" "$LAB/rendimiento.cfv"
 fi
-: > "$SALIDA/rendimiento_c.tsv"
-if command -v gcc > /dev/null 2>&1 && gcc -O2 "$LAB/bench_c.c" -o "$T/bench_c" 2>/dev/null; then
-    "$T/bench_c" | awk '$1 == "BENCH" {print $2 "\t" $3}' > "$SALIDA/rendimiento_c.tsv"
-fi
+sh "$LAB/lenguajes/medir.sh" "$SALIDA/lenguajes.tsv" > /dev/null 2>&1 || true
 regresiones=0
 if [ -n "${BASE_RENDIMIENTO:-}" ] && [ -s "$BASE_RENDIMIENTO" ]; then
     while IFS="$(printf '\t')" read -r nombre ms; do
@@ -268,18 +266,36 @@ unicas=$(cut -f1 "$SALIDA/fallas.tsv" | sort -u | wc -l)
         echo "- stdlib: la línea indica semilla y caso; la entrada exacta está en \`casos/falla-N.bin\`"
     fi
     echo
-    echo "## ⚡ Rendimiento"
+    echo "## ⚡ Rendimiento: C-Forge contra los demás lenguajes"
     echo
-    echo "| Prueba | C-Forge (ms) | C -O2 (ms) | C-Forge / C | Corrida anterior (ms) |"
-    echo "|---|---|---|---|---|"
+    echo "Milisegundos (menos es mejor). Mismo algoritmo en cada lenguaje. **C-Forge / mejor** = cuántas veces más lento es C-Forge que el lenguaje más rápido."
+    echo
+    langs=$(cut -f1 "$SALIDA/lenguajes.tsv" 2>/dev/null | awk '!v[$0]++' | tr '\n' '|')
+    printf '| Prueba | **C-Forge** |'; echo "$langs" | tr '|' '\n' | while IFS= read -r l; do [ -n "$l" ] && printf ' %s |' "$l"; done; echo ' Más rápido | C-Forge / mejor | Puesto de C-Forge | Corrida anterior |'
+    printf '|---|---|'; echo "$langs" | tr '|' '\n' | while IFS= read -r l; do [ -n "$l" ] && printf -- '---|'; done; echo '---|---|---|---|'
     while IFS="$(printf '\t')" read -r nombre ms; do
-        c=$(awk -F '\t' -v n="$nombre" '$1 == n {print $2}' "$SALIDA/rendimiento_c.tsv" 2>/dev/null)
+        fila="| $nombre | **$ms** |"
+        mejor_l="C-Forge"; mejor_ms=$ms; puesto=1; total=1
+        for l in $(echo "$langs" | tr ' |' '_ '); do
+            ln=$(echo "$l" | tr '_' ' ')
+            v=$(awk -F '\t' -v a="$ln" -v n="$nombre" '$1 == a && $2 == n {print $3}' "$SALIDA/lenguajes.tsv")
+            fila="$fila ${v:-—} |"
+            if [ -n "$v" ]; then
+                total=$((total + 1))
+                [ "$v" -lt "$ms" ] && puesto=$((puesto + 1))
+                if [ "$v" -lt "$mejor_ms" ]; then mejor_ms=$v; mejor_l=$ln; fi
+            fi
+        done
         b=""; [ -n "${BASE_RENDIMIENTO:-}" ] && [ -s "$BASE_RENDIMIENTO" ] && b=$(awk -F '\t' -v n="$nombre" '$1 == n {print $2}' "$BASE_RENDIMIENTO")
-        r="—"; [ -n "$c" ] && r=$(awk -v a="$ms" -v b="$c" 'BEGIN { if (b < 1) b = 1; printf "%.1f×", a / b }')
-        echo "| $nombre | $ms | ${c:-—} | $r | ${b:-—} |"
+        if [ "$total" -gt 1 ]; then
+            r=$(awk -v a="$ms" -v b="$mejor_ms" 'BEGIN { if (b < 1) b = 1; if (a < 1) a = 1; printf "%.1f×", a / b }')
+            echo "$fila $mejor_l | $r | $puesto de $total | ${b:-—} |"
+        else
+            echo "$fila — | — | — | ${b:-—} |"
+        fi
     done < "$SALIDA/rendimiento.tsv"
     echo
-    echo "Una regresión es una prueba más de 30 % (y 30 ms) más lenta que la corrida anterior. Los tiempos de los servidores de GitHub varían un poco entre corridas."
+    echo "Las pruebas sin equivalente en otros lenguajes solo se comparan con la corrida anterior. Una **regresión** es una prueba más de 30 % (y 30 ms) más lenta que la corrida anterior. Los tiempos de los servidores de GitHub varían un poco entre corridas."
     echo
     echo "## 💧 Memoria"
     echo
