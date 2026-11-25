@@ -86,7 +86,7 @@ funcion entrada(semillas, patologicas) {
 // ── Objetivos ───────────────────────────────────────────────────────────────
 
 sea JSON_OK = ["{\"a\": [1, 2.5, -3e10, true, false, null], \"b\": {\"c\": \"ñ\\u00e1\\n\"}}", "[]", "\"x\"", "123456789012345678901234567890", "[[[[1]]]]"]
-sea JSON_MAL = [anidado("[", "]", 100000), anidado("{\"a\":", "}", 50000), "\"" + texto_repetir("\\u0000", 20000) + "\"", "1" + texto_repetir("0", 100000), "[" + texto_repetir("1,", 200000) + "1]", "\"\\uD800\\uDC00\\uDFFF\"", "-", "1e", "[1,]", "{\"a\"}"]
+sea JSON_MAL = [anidado("[", "]", 100000), anidado("[", "]", 2000000), texto_repetir("[", 500000), "{" + texto_repetir("\"a\":1,", 100000) + "\"a\":1}", "\"\\uDBFF\\uDBFF\"", "\"" + char_de(192) + char_de(128) + char_de(237) + char_de(160) + char_de(128) + "\"", anidado("{\"a\":", "}", 50000), "\"" + texto_repetir("\\u0000", 20000) + "\"", "1" + texto_repetir("0", 100000), "[" + texto_repetir("1,", 200000) + "1]", "\"\\uD800\\uDC00\\uDFFF\"", "-", "1e", "[1,]", "{\"a\"}"]
 
 sea B64_OK = ["aG9sYSBtdW5kbw==", "", "AA==", "////", "YQ"]
 sea B64_MAL = ["====", "a===", texto_repetir("A", 300001), "ññ==", "aGVsbG8=\n\n\nd29ybGQ="]
@@ -94,11 +94,14 @@ sea B64_MAL = ["====", "a===", texto_repetir("A", 300001), "ññ==", "aGVsbG8=\n
 sea CSV_OK = ["a,b,c\n1,2,3\n", "\"x\"\"y\",z\r\n", "nombre;edad\nana;3", ",,,\n,,,"]
 sea CSV_MAL = ["\"" + texto_repetir("a", 100000), texto_repetir(",", 200000), texto_repetir("\"\"", 50000), "\"a\nb\nc"]
 
-sea REGEX_PATRONES = ["(a+)+$", "(a|a)*$", "(a|aa)+$", "^(\\w+\\s?)*$", "(.*a){20}", "[a-z]+@[a-z]+\\.[a-z]+", "\\d{3}-\\d{4}", "(", ")", "[", "a{999999}", "\\", "(?<n>x)\\k<n>", "*", "a**", "[z-a]", "(a)\\9"]
-sea REGEX_TEXTOS = [texto_repetir("a", 40) + "!", "usuario@correo.cl", texto_repetir("aaaa ", 30) + "!", "", "123-4567"]
+sea REGEX_PATRONES = ["(a+)+$", "(a|a)*$", "(a|aa)+$", "^(\\w+\\s?)*$", "(.*a){20}",
+    // Retroceso catastrófico (ReDoS): deben responder rápido o lanzar un error, nunca colgarse.
+    "a*r*a*r*a*r*a*r*a*r*a*r*a*r*", "(a*)*b", "(x+x+)+y", "((a+)+)+$", "^(a?){25}a{25}$", "(\\d+)*[a-z]",
+    "(a|b|ab)*c", "(.*){1,32000}[bc]", "^(([a-z])+.)+[A-Z]([a-z])+$", "(\\w+\\s?)+$", "(a+){2,}+$", "[a-z]+@[a-z]+\\.[a-z]+", "\\d{3}-\\d{4}", "(", ")", "[", "a{999999}", "\\", "(?<n>x)\\k<n>", "*", "a**", "[z-a]", "(a)\\9"]
+sea REGEX_TEXTOS = [texto_repetir("a", 40) + "!", texto_repetir("x", 40), texto_repetir("1", 40) + "!", texto_repetir("ab", 30) + "!", texto_repetir("a", 100000) + "!", texto_repetir("aaaaaaaaaaaaaaaaaaaaaaaa ", 4) + "!", "usuario@correo.cl", texto_repetir("aaaa ", 30) + "!", "", "123-4567"]
 
 sea XML_OK = ["<a x=\"1\"><b>texto &amp; más</b><c/></a>", "<?xml version=\"1.0\"?><r/>", "<a><![CDATA[<<>>]]></a>"]
-sea XML_MAL = [anidado("<a>", "</a>", 50000), "<a " + texto_repetir("x=\"1\" ", 50000) + "/>", "<!DOCTYPE a [<!ENTITY x \"&x;&x;\">]><a>&x;</a>", "<a>&#99999999;</a>", "<a></b>", "<", "<<<<>>>>"]
+sea XML_MAL = [anidado("<a>", "</a>", 50000), anidado("<a>", "</a>", 1000000), "<!DOCTYPE a [<!ENTITY a \"" + texto_repetir("x", 1000) + "\"><!ENTITY b \"" + texto_repetir("&a;", 1000) + "\"><!ENTITY c \"" + texto_repetir("&b;", 1000) + "\">]><a>&c;</a>", "<!DOCTYPE a [<!ENTITY x SYSTEM \"file:///etc/passwd\">]><a>&x;</a>", "<a " + texto_repetir("x=\"1\" ", 50000) + "/>", "<!DOCTYPE a [<!ENTITY x \"&x;&x;\">]><a>&x;</a>", "<a>&#99999999;</a>", "<a></b>", "<", "<<<<>>>>"]
 
 sea MD_OK = ["# Título\n\n**negrita** y `código`\n\n- uno\n- dos\n\n[enlace](http://x.cl)", "```\ncódigo\n```", "> cita\n>> doble"]
 sea MD_MAL = [texto_repetir(">", 100000) + " x", texto_repetir("*", 100000), texto_repetir("[", 50000) + texto_repetir("](", 50000), texto_repetir("- ", 50000) + "x", "<script>alert(1)</script>", "[x](javascript:alert(1))"]
@@ -166,6 +169,16 @@ funcion png_minimo() {
 //   después de un caso que colgó el proceso.
 
 sea args = argumentos()
+
+// Modo reproductor: ataques --archivo OBJETIVO RUTA → ataca OBJETIVO con el
+// contenido exacto de RUTA (para volver a probar fallas antiguas).
+si (longitud(args) > 2 y args[0] == "--archivo") {
+    sea p = preparar(args[1])
+    intentar { p["f"](leer_archivo(args[2])) } capturar (e) { }
+    mostrar("FIN 1 casos")
+    salir(0)
+}
+
 sea semilla = 1
 sea casos = 200
 sea desde = 0

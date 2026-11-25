@@ -31,7 +31,7 @@ funcion pieza(i) {
     si (tipo == 6) { retornar "intentar { mostrar(" + elegir(["1 / 0", "10 % 0", "[1, 2][99]", "{}[\"x\"].y", "nulo.algo", "a_numero(\"zz\")", "texto_subcadena(\"abc\", 5, 2)", "lanzar \"boom\""]) + ") } capturar (e) { mostrar(\"error: \" + e) }" }
     si (tipo == 7) { retornar "sea s" + i + " = 0\npara k en rango(0, " + (n % 100000) + ") { intentar { si (k % 3 == 0) { lanzar k } s" + i + " = s" + i + " + 1 } capturar (e) { s" + i + " = s" + i + " - 1 } }\nmostrar(s" + i + ")" }
     si (tipo == 8) { retornar "funcion hacer" + i + "(n) { si (n == 0) { retornar funcion() { retornar 1 } } sea g = hacer" + i + "(n - 1) retornar funcion() { retornar g() + 1 } }\nmostrar(hacer" + i + "(" + (n % 50000) + ")())" }
-    si (tipo == 9) { retornar "mostrar(longitud(a_texto(potencia(" + elegir(["2", "-3", "99999999999999999999"]) + ", " + elegir(["0", "1", "64", "1000", "100000", "-1"]) + ") * " + elegir(["99999999999999999999999999999999", "-1", "0"]) + ")))" }
+    si (tipo == 9) { retornar "mostrar(longitud(a_texto(potencia(" + elegir(["2", "-3", "99999999999999999999"]) + ", " + elegir(["0", "1", "64", "1000", "-1"]) + ") * " + elegir(["99999999999999999999999999999999", "-1", "0"]) + ")))" }
     si (tipo == 10) { retornar "mostrar(a_numero(\"" + texto_repetir("9", n % 20000) + "\") + 1)" }
     si (tipo == 11) { retornar "clase Nodo" + i + " { sea sig sea v funcion constructor(v) { esto.v = v esto.sig = nulo } }\nsea r" + i + " = Nodo" + i + "(0)\nsea q" + i + " = r" + i + "\npara k en rango(0, " + (n % 200000) + ") { q" + i + ".sig = Nodo" + i + "(k) q" + i + " = q" + i + ".sig }\nmostrar(q" + i + ".v)" }
     si (tipo == 12) { retornar "mostrar(longitud(texto_dividir(texto_repetir(\"a,\", " + n + "), \",\")))" }
@@ -50,6 +50,12 @@ si (longitud(args) > 0) { semilla = a_numero(args[0]) }
 sembrar(semilla)
 mostrar("// Fuzz Lab · programa de estrés · semilla " + semilla)
 sea piezas = 1 + azar(6)
+// Enteros gigantes de verdad (millones de cifras) solo de vez en cuando y
+// solos, para que su lentitud no tape otras fallas en el mismo programa.
+si (azar(50) == 0) {
+    mostrar("mostrar(longitud(a_texto(potencia(99999999999999999999, " + elegir(["20000", "50000"]) + "))))")
+    piezas = 0
+}
 sea i = 0
 mientras (i < piezas) {
     mostrar(pieza(i))

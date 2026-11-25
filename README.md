@@ -14,15 +14,23 @@ Laboratorio de ataques automáticos de Vemoris. Bombardea nuestros proyectos con
 
 | Motor | Qué hace |
 |---|---|
-| **stdlib** | JSON, Base64, URL, CSV, regex, XML, Markdown, números, LZ4, Snappy, Zstd, zlib, PNG y textos con entradas aleatorias, mutadas y patológicas (`ataques_stdlib.cfv`) |
-| **programas** | Programas de estrés generados: recursión profunda, enteros gigantes, memoria, closures, excepciones, a veces con el GC en estrés (`generador.cfv`) |
+| **stdlib** | JSON, Base64, URL, CSV, regex (incluye ReDoS), XML (incluye entidades en cadena), Markdown, números, LZ4, Snappy, Zstd, zlib, PNG y textos con entradas aleatorias, mutadas y patológicas |
+| **programas** | Programas de estrés generados: recursión profunda, enteros gigantes, memoria, closures, excepciones, a veces con el GC en estrés |
+| **diferencial** | El mismo programa compilado normal y con `--release` debe dar exactamente lo mismo (encuentra errores del optimizador) |
 | **mutaciones** | Programas reales de C-Forge con mutaciones, en el compilador y al ejecutar |
+| **formato** | `cforge fmt` no debe caerse, romper un programa ni dar otro resultado si se pasa dos veces |
 | **bytes** | Bytes aleatorios al compilador |
-| **cruzadas** | Resultados incorrectos: propiedades que siempre deben cumplirse (aritmética con enteros gigantes, ordenar, textos, JSON, Base64, URL y compresores de ida y vuelta) (`cruzadas.cfv`) |
-| **rendimiento** | Velocidad de C-Forge comparada con la corrida anterior (detecta si se pone más lento) y con **C, C++, Rust, Java, C#, JavaScript y TypeScript**, con el mismo algoritmo en cada uno (`rendimiento.cfv`, `lenguajes/`) |
-| **memoria** | Fugas: repite tareas 1000 y 4000 veces y vigila que la memoria no crezca sin control (`fugas.cfv`) |
+| **cruzadas** | Resultados incorrectos: propiedades que siempre deben cumplirse |
+| **rendimiento** | Velocidad contra la corrida anterior y contra C, C++, Rust, Java, C#, JavaScript y TypeScript |
+| **memoria** | Fugas: repite tareas 1000 y 4000 veces y vigila que la memoria no crezca sin control |
+| **regresiones** | Vuelve a probar todas las fallas de corridas anteriores y marca ✅ arreglada o 🔴 sigue |
 
-Una **falla** es un cierre por señal (segfault, abort, sin memoria), un cuelgue, un error que `intentar/capturar` no atrapa, un resultado incorrecto, una regresión de velocidad o una fuga de memoria. Los errores normales de C-Forge no cuentan.
+### Fuzz Lab 2.0
+
+- **Minimizador automático:** cada programa que falla se reduce solo al mínimo de líneas que sigue provocando la falla, y las fallas se agrupan por ese programa reducido (no por síntomas).
+- **Cuelgue o lento:** distingue un programa bloqueado (sin usar CPU) de uno demasiado lento.
+- **Sin procesos zombis:** al cortar un programa se cierra todo su árbol de procesos.
+- **En paralelo:** varios trabajadores a la vez (uno por núcleo, hasta 4), con tope de memoria por programa.
 
 ## Cómo funciona
 

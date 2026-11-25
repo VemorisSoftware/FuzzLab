@@ -60,6 +60,7 @@ jobs:
         env:
           CFORGE_DIR: cforge
           BASE_RENDIMIENTO: privado/reportes/cforge/rendimiento-base.tsv
+          PREVIOS: privado/reportes/cforge
           MINUTOS: ${{ github.event.inputs.minutos || '330' }}
         run: |
           mkdir -p salida
