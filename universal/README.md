@@ -23,6 +23,25 @@ cforge build universal/fuzzlab.cfv -o fuzzlab
 
 `@@` es el archivo con la entrada; si no está, la entrada va por stdin. Opcionales: `carpeta`, `excepciones_son_fallas` (para Python, JS, Java… una excepción sin atrapar cuenta), `patrones_falla` y `codigos_falla`.
 
+## 🧪 Sanitizadores (C, C++, Rust, Swift, Objective-C)
+
+Con `"compilar"`, Fuzz Lab compila el programa una vez por sanitizador y ataca con el primero (con cobertura real). Al final repasa el corpus, las fallas y miles de mutaciones con los demás, porque cada uno ve errores distintos:
+
+| Sanitizador | Encuentra |
+|---|---|
+| `asan` | desbordes de memoria, uso después de liberar, doble liberación, fugas |
+| `ubsan` | comportamiento indefinido: desborde de enteros, división por cero, punteros mal alineados |
+| `msan` | lectura de memoria sin iniciar |
+| `tsan` | carreras de datos entre hilos |
+
+```json
+{"compilar": "clang -g -O1 {banderas} parser.c -o {binario}",
+ "comando": "{binario} @@",
+ "sanitizadores": ["asan", "ubsan", "msan"]}
+```
+
+Las palabras entre comillas del código fuente (cabeceras mágicas, comandos) se usan como diccionario prioritario y como semillas.
+
 ## Cómo piensa
 
 | Técnica | Qué hace |
@@ -45,6 +64,7 @@ clang -g -fsanitize=address -fsanitize-coverage=trace-pc-guard universal/ejemplo
 ./fuzzlab universal/ejemplos/parser.json   # desbordamiento de memoria escondido tras 2 candados
 ./fuzzlab universal/ejemplos/ping.json     # inyección de comandos (Python)
 ./fuzzlab universal/ejemplos/buscar.json   # inyección SQL (Python)
+./fuzzlab universal/ejemplos/tres.json     # 3 errores en C: cada sanitizador encuentra el suyo
 ```
 
 Resultado: `salida-*/REPORTE.md`, `fallas/` (entradas mínimas), `fallas.json` y `corpus/`.

@@ -1,0 +1,10 @@
+{
+  "nombre": "tres errores (ASan, UBSan, MSan)",
+  "compilar": "clang -g -O1 {banderas} tres.c -o {binario}",
+  "comando": "{binario} @@",
+  "sanitizadores": ["asan", "ubsan", "msan"],
+  "carpeta": "universal/ejemplos",
+  "semillas": "universal/ejemplos/semillas-tres",
+  "minutos": 2,
+  "salida": "salida-tres"
+}

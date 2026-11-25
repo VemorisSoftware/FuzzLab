@@ -133,32 +133,93 @@ sea MARCA_CANARIO = T + "/canario_disparado"
 escribir_archivo(T + "/canario/fl_canario_cmd", "#!/bin/sh\ntouch " + comillas(MARCA_CANARIO) + "\n")
 sistema_comando("chmod +x " + comillas(T + "/canario/fl_canario_cmd"))
 
+// ── Sanitizadores (compilación con varias revisiones de memoria) ─────────
+// Si el objetivo trae "compilar", se compila una versión por sanitizador:
+//   "compilar": "clang -g -O1 {banderas} parser.c -o {binario}",
+//   "comando": "{binario} @@",
+//   "sanitizadores": ["asan", "ubsan", "msan", "tsan"]
+// El primero se usa para atacar (con cobertura); con los demás se vuelve a
+// probar todo el corpus al final, porque cada uno ve errores distintos:
+//   asan  desbordes, uso tras liberar, fugas        ubsan comportamiento indefinido
+//   msan  memoria sin iniciar                       tsan  carreras entre hilos
+sea BANDERAS = {
+    "asan": "-fsanitize=address -fsanitize-coverage=trace-pc-guard -fno-omit-frame-pointer",
+    "ubsan": "-fsanitize=undefined -fno-sanitize-recover=all -fsanitize-coverage=trace-pc-guard",
+    "msan": "-fsanitize=memory -fsanitize-memory-track-origins -fno-omit-frame-pointer",
+    "tsan": "-fsanitize=thread"
+}
+sea MARCA_BIN = "{" + "binario}"
+sea MARCA_BAN = "{" + "banderas}"
+sea BINARIOS = {}
+sea SANITIZADORES = valor(CFG, "sanitizadores", ["asan"])
+sea COMPILACION = []
+si (tiene_clave(CFG, "compilar")) {
+    para san en SANITIZADORES {
+        si (tiene_clave(BANDERAS, san)) {
+            sea bin = T + "/objetivo-" + san
+            sea orden = texto_reemplazar(texto_reemplazar(CFG["compilar"], MARCA_BAN, BANDERAS[san]), MARCA_BIN, comillas(bin))
+            sea salida = sistema_comando("cd " + comillas(CARPETA) + " && " + orden + " 2>&1; echo \"FL_CODIGO=$?\"")
+            si (texto_indice(salida, "FL_CODIGO=0") >= 0) {
+                BINARIOS[san] = bin
+                agregar(COMPILACION, "| " + san + " | ✅ compilado |")
+            } sino {
+                agregar(COMPILACION, "| " + san + " | ❌ no compiló (" + texto_reemplazar(subtexto(recortar(salida), 0, minimo(longitud(recortar(salida)), 120)), "\n", " ") + ") |")
+            }
+        }
+    }
+    si (longitud(mapa_claves(BINARIOS)) == 0) {
+        mostrar("No se pudo compilar el objetivo con ningún sanitizador.")
+        salir(2)
+    }
+}
+sea SAN_PRINCIPAL = ""
+para san en SANITIZADORES { si (SAN_PRINCIPAL == "" y tiene_clave(BINARIOS, san)) { SAN_PRINCIPAL = san } }
+
 // El comando del objetivo va en un guion: @@ es el archivo de entrada.
 sea ENTRADA = T + "/entrada.bin"
-sea cmd = CFG["comando"]
-si (texto_indice(cmd, "@@") >= 0) {
-    cmd = texto_reemplazar(cmd, "@@", comillas(ENTRADA))
-} sino {
-    cmd = cmd + " < " + comillas(ENTRADA)
-}
-escribir_archivo(T + "/correr.sh", "cd " + comillas(CARPETA) + " || exit 125\nexec " + cmd + "\n")
-
 sea SEG = piso((LIMITE_MS + 999) / 1000)
-sea LINEA = "rm -f " + comillas(T + "/cov") + "/*.sancov " + comillas(MARCA_CANARIO) + "; " +
-    "ASAN_OPTIONS=coverage=1:coverage_dir=" + comillas(T + "/cov") + ":detect_leaks=1:abort_on_error=0:symbolize=1 " +
-    "UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 " +
-    "PATH=" + comillas(T + "/canario") + ":\"$PATH\" " +
-    "timeout -s KILL " + SEG + " sh " + comillas(T + "/correr.sh") +
-    " > " + comillas(T + "/out") + " 2> " + comillas(T + "/err") + "; echo $?"
+
+// Arma la línea que ejecuta el objetivo con un binario dado (o el comando tal cual).
+funcion preparar_linea(nombre, binario) {
+    sea cmd = CFG["comando"]
+    si (binario != "") { cmd = texto_reemplazar(cmd, MARCA_BIN, comillas(binario)) }
+    si (texto_indice(cmd, "@@") >= 0) {
+        cmd = texto_reemplazar(cmd, "@@", comillas(ENTRADA))
+    } sino {
+        cmd = cmd + " < " + comillas(ENTRADA)
+    }
+    sea guion = T + "/correr-" + nombre + ".sh"
+    escribir_archivo(guion, "cd " + comillas(CARPETA) + " || exit 125\nexec " + cmd + "\n")
+    retornar "rm -f " + comillas(T + "/cov") + "/*.sancov " + comillas(MARCA_CANARIO) + "; " +
+        "ASAN_OPTIONS=coverage=1:coverage_dir=" + comillas(T + "/cov") + ":detect_leaks=1:abort_on_error=0:symbolize=1 " +
+        "UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 " +
+        "MSAN_OPTIONS=print_stacktrace=1 TSAN_OPTIONS=halt_on_error=1 " +
+        "PATH=" + comillas(T + "/canario") + ":\"$PATH\" " +
+        "timeout -s KILL " + SEG + " sh " + comillas(guion) +
+        " > " + comillas(T + "/out") + " 2> " + comillas(T + "/err") + "; echo $?"
+}
+
+sea DEPURAR = variable_entorno("FL_DEPURAR") != nulo y variable_entorno("FL_DEPURAR") != ""
+sea LINEA = ""
+si (SAN_PRINCIPAL != "") { LINEA = preparar_linea(SAN_PRINCIPAL, BINARIOS[SAN_PRINCIPAL]) } sino { LINEA = preparar_linea("principal", "") }
 
 // ── Ejecución ───────────────────────────────────────────────────────────
 
 sea EJECUCIONES = 0
 
 funcion ejecutar(datos) {
+    sea r = ejecutar_con(LINEA, datos)
+    si (DEPURAR y EJECUCIONES <= 3) {
+        mostrar("[depurar] " + LINEA)
+        mostrar("[depurar] código " + r["codigo"] + " · stderr: " + subtexto(r["err"], 0, minimo(300, longitud(r["err"]))))
+    }
+    retornar r
+}
+
+funcion ejecutar_con(linea, datos) {
     escribir_archivo(ENTRADA, datos)
     sea t0 = tiempo_ms()
-    sea codigo = a_numero(recortar(sistema_comando(LINEA)))
+    sea codigo = a_numero(recortar(sistema_comando(linea)))
     sea ms = tiempo_ms() - t0
     EJECUCIONES += 1
     sea r = {"codigo": codigo, "ms": ms, "out": "", "err": "", "canario": existe_archivo(MARCA_CANARIO)}
@@ -233,7 +294,8 @@ funcion clase_error(err, patron) {
             sea fin = texto_indice(resto, " on ")
             si (fin < 0) { fin = texto_indice(resto, " at ") }
             si (fin > 0) { resto = subtexto(resto, 0, fin) }
-            retornar normalizar(subtexto(resto, 0, minimo(longitud(resto), 60)))
+            sea norm = normalizar(resto)
+            retornar subtexto(norm, 0, minimo(longitud(norm), 60))
         }
     }
     retornar ""
@@ -391,7 +453,11 @@ sea CARGAS = [";fl_canario_cmd;", "$(fl_canario_cmd)", "`fl_canario_cmd`", "|fl_
     char_de(0), char_de(255) + char_de(254), char_de(192) + char_de(128), char_de(237) + char_de(160) + char_de(128)]
 
 sea DICCIONARIO = []
-para p en valor(CFG, "diccionario", []) { agregar(DICCIONARIO, p) }
+sea PRIORITARIAS = []           // del usuario y del código fuente: se eligen la mitad de las veces
+para p en valor(CFG, "diccionario", []) {
+    agregar(DICCIONARIO, p)
+    agregar(PRIORITARIAS, p)
+}
 para p en CARGAS { agregar(DICCIONARIO, p) }
 para p en INTERESANTES_TXT { agregar(DICCIONARIO, p) }
 
@@ -423,6 +489,11 @@ funcion sobrescribir(d, i, t) {
     retornar subtexto(d, 0, i) + t + subtexto(d, fin, longitud(d))
 }
 
+funcion palabra() {
+    si (longitud(PRIORITARIAS) > 0 y azar(2) == 0) { retornar elegir(PRIORITARIAS) }
+    retornar elegir(DICCIONARIO)
+}
+
 funcion mutar_una(d) {
     sea n = longitud(d)
     sea tipo = azar(16)
@@ -442,9 +513,12 @@ funcion mutar_una(d) {
         sea largo = 1 + azar(minimo(n - i, 64))
         retornar insertar(d, i, texto_repetir(subtexto(d, i, i + largo), 1 + azar(4)))
     }
-    si (tipo == 7) { retornar insertar(d, i, elegir(DICCIONARIO)) }                                      // palabra del diccionario
-    si (tipo == 8) { retornar sobrescribir(d, i, elegir(DICCIONARIO)) }
-    si (tipo == 9) { retornar insertar(d, i, elegir(DICCIONARIO)) }
+    si (tipo == 7) { retornar insertar(d, i, palabra()) }                                      // palabra del diccionario
+    si (tipo == 8) {
+        si (azar(3) == 0) { i = 0 }                                                                      // las cabeceras van al inicio
+        retornar sobrescribir(d, i, palabra())
+    }
+    si (tipo == 9) { retornar insertar(d, 0, palabra()) }
     si (tipo == 10) { retornar insertar(d, i, texto_repetir(char_de(azar(256)), 1 + azar(128))) }       // repetir un byte
     si (tipo == 11 y longitud(CORPUS) > 1) {                                                             // cruzar con otra entrada
         sea otra = elegir(CORPUS)["d"]
@@ -559,10 +633,52 @@ funcion palabras_de_binario(ruta) {
         i += 1
     }
 }
+// Textos entre comillas del código fuente (los archivos que aparecen en
+// "compilar"): ahí están las palabras mágicas que el programa compara.
+funcion palabras_de_fuente(ruta) {
+    sea d = ""
+    intentar { d = leer_archivo(ruta) } capturar (e) { retornar nulo }
+    sea i = 0
+    sea vistas = 0
+    mientras (i < longitud(d) y vistas < 300) {
+        sea b = byte_en(d, i)
+        si (b == 34 o b == 39) {
+            sea j = i + 1
+            mientras (j < longitud(d) y byte_en(d, j) != b y byte_en(d, j) != 10 y j - i < 64) {
+                si (byte_en(d, j) == 92) { j += 1 }
+                j += 1
+            }
+            si (j < longitud(d) y byte_en(d, j) == b y j - i - 1 >= 1) {
+                sea lit = subtexto(d, i + 1, j)
+                si (texto_indice(lit, "%") < 0 y texto_indice(lit, "\\") < 0) {
+                    agregar(DICCIONARIO, lit)
+                    agregar(PRIORITARIAS, lit)
+                    vistas += 1
+                }
+            }
+            i = j + 1
+        } sino {
+            i += 1
+        }
+    }
+}
+si (tiene_clave(CFG, "compilar")) {
+    para parte en texto_dividir(CFG["compilar"], " ") {
+        sea ruta = parte
+        si (no empieza(ruta, "/")) { ruta = CARPETA + "/" + parte }
+        para ext en [".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".rs", ".swift", ".m", ".mm", ".go", ".zig"] {
+            si (longitud(parte) > longitud(ext) y subtexto(parte, longitud(parte) - longitud(ext), longitud(parte)) == ext y existe_archivo(ruta)) { palabras_de_fuente(ruta) }
+        }
+    }
+}
+para san en mapa_claves(BINARIOS) { palabras_de_binario(BINARIOS[san]) }
 para parte en texto_dividir(CFG["comando"], " ") {
     sea ruta = parte
     si (no empieza(ruta, "/")) { ruta = CARPETA + "/" + parte }
-    si (parte != "@@" y existe_archivo(ruta) y no es_carpeta(ruta)) { palabras_de_binario(ruta) }
+    si (parte != "@@" y existe_archivo(ruta) y no es_carpeta(ruta)) {
+        palabras_de_fuente(ruta)
+        palabras_de_binario(ruta)
+    }
 }
 
 sea INICIO = tiempo_ms()
@@ -591,6 +707,13 @@ para carpeta en [SEMILLAS, SALIDA + "/corpus"] {
                 n_semillas += 1
             }
         }
+    }
+}
+// Cada palabra prioritaria como entrada propia (sola y seguida de datos).
+para w en PRIORITARIAS {
+    si (longitud(w) >= 2) {
+        probar_semilla(w)
+        probar_semilla(w + texto_repetir("A", 40))
     }
 }
 si (longitud(CORPUS) == 0) {
@@ -701,6 +824,42 @@ mientras (tiempo_ms() < FIN) {
     }
 }
 
+// ── Repaso con los demás sanitizadores ──────────────────────────────────
+sea REPASO = []
+para san en mapa_claves(BINARIOS) {
+    si (san != SAN_PRINCIPAL) {
+        sea linea_san = preparar_linea(san, BINARIOS[san])
+        sea antes = N_FALLAS
+        sea probadas = 0
+        sea entradas = []
+        para e en CORPUS { agregar(entradas, e["d"]) }
+        para firma en mapa_claves(FALLAS) { agregar(entradas, leer_archivo(SALIDA + "/" + FALLAS[firma]["archivo"])) }
+        // Más mutaciones del corpus: un error que solo ve este sanitizador
+        // puede no abrir camino nuevo para el principal (y no estar en el corpus).
+        sea extra = minimo(2000, maximo(200, piso(EJECUCIONES / 10)))
+        para k en rango(0, extra) { agregar(entradas, mutar(elegir(CORPUS)["d"])) }
+        para d en entradas {
+            sea r = ejecutar_con(linea_san, d)
+            probadas += 1
+            sea f = clasificar(r)
+            si (f != nulo) {
+                f["tipo"] = f["tipo"] + " [" + san + "]"
+                f["firma"] = san + "|" + f["firma"]
+                si (no tiene_clave(FALLAS, f["firma"])) {
+                    N_FALLAS += 1
+                    sea archivo = "fallas/falla-" + N_FALLAS + "-" + san + ".bin"
+                    escribir_archivo(SALIDA + "/" + archivo, d)
+                    FALLAS[f["firma"]] = {"tipo": f["tipo"], "detalle": f["detalle"], "archivo": archivo, "veces": 1, "bytes": longitud(d), "antes": longitud(d)}
+                    mostrar("  ✗ " + f["tipo"] + " — " + f["detalle"])
+                } sino {
+                    FALLAS[f["firma"]]["veces"] = FALLAS[f["firma"]]["veces"] + 1
+                }
+            }
+        }
+        agregar(REPASO, "| " + san + " | " + probadas + " entradas | " + (N_FALLAS - antes) + " fallas nuevas |")
+    }
+}
+
 // ── Reducir el corpus: las entradas más chicas que cubren todo ──────────
 
 funcion por_tamano(a, b) { retornar longitud(a["d"]) - longitud(b["d"]) }
@@ -770,6 +929,22 @@ si (longitud(REGRESIONES) > 0) {
         sea e = "🔴 sigue"
         si (g["estado"] == "arreglada") { e = "✅ arreglada" }
         agregar(rep, "| " + e + " | " + g["tipo"] + " | " + texto_reemplazar(g["detalle"], "|", "/") + " |")
+    }
+    agregar(rep, "")
+}
+si (longitud(COMPILACION) > 0) {
+    agregar(rep, "## 🧪 Sanitizadores")
+    agregar(rep, "")
+    agregar(rep, "Ataque con **" + SAN_PRINCIPAL + "**; el corpus y las fallas se repasaron con los demás.")
+    agregar(rep, "")
+    agregar(rep, "| Sanitizador | Compilación |")
+    agregar(rep, "|---|---|")
+    para f en COMPILACION { agregar(rep, f) }
+    si (longitud(REPASO) > 0) {
+        agregar(rep, "")
+        agregar(rep, "| Repaso | Probadas | Resultado |")
+        agregar(rep, "|---|---|---|")
+        para f en REPASO { agregar(rep, f) }
     }
     agregar(rep, "")
 }
