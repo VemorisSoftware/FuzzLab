@@ -1,0 +1,9 @@
+{
+  "nombre": "parser en C (con cobertura real)",
+  "comando": "./parser @@",
+  "carpeta": "universal/ejemplos",
+  "semillas": "universal/ejemplos/semillas-c",
+  "limite_ms": 2000,
+  "minutos": 5,
+  "salida": "salida-parser"
+}

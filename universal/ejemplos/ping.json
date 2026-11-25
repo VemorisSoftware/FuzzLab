@@ -1,0 +1,10 @@
+{
+  "nombre": "script de ping en Python",
+  "comando": "python3 ping.py @@",
+  "carpeta": "universal/ejemplos",
+  "semillas": "universal/ejemplos/semillas-ping",
+  "limite_ms": 3000,
+  "minutos": 2,
+  "salida": "salida-ping",
+  "excepciones_son_fallas": true
+}

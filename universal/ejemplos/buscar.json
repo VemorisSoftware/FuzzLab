@@ -1,0 +1,9 @@
+{
+  "nombre": "buscador SQL en Python",
+  "comando": "python3 buscar.py @@",
+  "carpeta": "universal/ejemplos",
+  "semillas": "universal/ejemplos/semillas-sql",
+  "limite_ms": 3000,
+  "minutos": 1,
+  "salida": "salida-buscar"
+}

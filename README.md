@@ -6,6 +6,9 @@ Laboratorio de ataques automáticos de Vemoris. Bombardea nuestros proyectos con
 
 ## Objetivos
 
+**Fuzz Lab Universal** ([`universal/`](universal/README.md)) ataca cualquier programa en cualquier lenguaje, con cobertura real, diccionario automático, inyección dirigida y reducción de fallas.
+
+
 | Proyecto | Carpeta | Automatización |
 |---|---|---|
 | **C-Forge** ([VemorisSoftware/cforge](https://github.com/VemorisSoftware/cforge)) | `objetivos/cforge/` | `.github/workflows/cforge.yml` |

@@ -1,0 +1,784 @@
+// universal/fuzzlab.cfv — Fuzz Lab Universal de Vemoris Software.
+//
+// Ataca CUALQUIER programa (escrito en cualquier lenguaje) que lea una
+// entrada desde un archivo o desde la entrada estándar. Escrito 100 % en
+// C-Forge, sin depender de herramientas de fuzzing externas.
+//
+//   cforge build universal/fuzzlab.cfv -o fuzzlab
+//   ./fuzzlab objetivo.json
+//
+// objetivo.json (solo "comando" es obligatorio):
+//   {
+//     "nombre": "mi-parser",
+//     "comando": "./mi_parser @@",      @@ = archivo con la entrada; sin @@ va por stdin
+//     "carpeta": ".",                   dónde se ejecuta el comando
+//     "semillas": "semillas",           carpeta con entradas válidas de ejemplo
+//     "diccionario": ["<a>", "SELECT"], palabras útiles para el formato atacado
+//     "limite_ms": 2000,                más que esto es un cuelgue
+//     "minutos": 30,
+//     "salida": "fuzzlab-salida",
+//     "excepciones_son_fallas": falso,  verdadero: un "Traceback"/"panicked"/excepción sin atrapar cuenta
+//     "patrones_falla": ["FATAL"],      textos extra que, si aparecen en stderr, son falla
+//     "codigos_falla": [3]              códigos de salida extra que son falla
+//   }
+//
+// Cómo piensa (en vez de atacar a ciegas):
+//   1. Cobertura: si el programa se compiló con -fsanitize=address
+//      -fsanitize-coverage=trace-pc-guard (C, C++, Rust, Swift…), lee qué
+//      partes del código recorrió cada entrada. Si no, usa el
+//      "comportamiento" (código de salida, tipos de mensajes, tamaños y
+//      tiempos) como señal. Toda entrada que logra algo nuevo se guarda en
+//      el corpus y se usa como base para las siguientes.
+//   2. Mutaciones tipo havoc: bits, bytes, valores límite, aritmética,
+//      bloques, diccionario (propio + extraído de las semillas) y cruces
+//      entre entradas del corpus.
+//   3. Detectores: cierres por señal, cuelgues, informes de sanitizadores
+//      (ASan, UBSan, LSan, TSan), inyección de comandos (con un programa
+//      canario que se activa si el objetivo ejecuta lo que recibe),
+//      posible inyección SQL y recorrido de rutas.
+//   4. Cada falla nueva se reduce al mínimo de bytes que la sigue
+//      provocando y se agrupa por su firma (no por síntomas).
+//   5. Memoria de fallas: al empezar vuelve a probar las fallas guardadas
+//      y dice cuáles ya están arregladas.
+//   6. Al final reduce el corpus a las entradas más chicas que mantienen
+//      toda la cobertura.
+
+importar "sistema"
+importar "json"
+
+// ── Utilidades ──────────────────────────────────────────────────────────
+
+funcion recortar(t) {
+    si (t == nulo) { retornar "" }
+    retornar texto_recortar(t)
+}
+
+funcion azar(n) {
+    si (n <= 0) { retornar 0 }
+    retornar aleatorio_entero(0, n - 1)
+}
+
+funcion elegir(l) { retornar l[azar(longitud(l))] }
+
+funcion comillas(t) { retornar "'" + texto_reemplazar(t, "'", "'\\''") + "'" }
+
+funcion valor(cfg, clave, defecto) {
+    si (tiene_clave(cfg, clave)) { retornar cfg[clave] }
+    retornar defecto
+}
+
+funcion empieza(t, p) { retornar longitud(t) >= longitud(p) y subtexto(t, 0, longitud(p)) == p }
+
+// Normaliza un mensaje: sin números, direcciones ni rutas temporales.
+funcion normalizar(linea) {
+    sea r = []
+    sea i = 0
+    sea n = longitud(linea)
+    sea en_numero = falso
+    mientras (i < n y i < 200) {
+        sea b = byte_en(linea, i)
+        si ((b >= 48 y b <= 57) o (en_numero y ((b >= 97 y b <= 102) o b == 120))) {
+            si (no en_numero) { agregar(r, "N") }
+            en_numero = verdadero
+        } sino {
+            en_numero = falso
+            agregar(r, char_de(b))
+        }
+        i += 1
+    }
+    retornar texto_unir(r, "")
+}
+
+funcion log2(n) {
+    sea k = 0
+    mientras (n > 1) {
+        n = piso(n / 2)
+        k += 1
+    }
+    retornar k
+}
+
+// ── Configuración ───────────────────────────────────────────────────────
+
+sea args = argumentos()
+si (longitud(args) < 1) {
+    mostrar("Uso: fuzzlab objetivo.json")
+    salir(2)
+}
+sea CFG = cfv_json_parsear(leer_archivo(args[0]))
+si (no tiene_clave(CFG, "comando")) {
+    mostrar("objetivo.json: falta \"comando\"")
+    salir(2)
+}
+sea NOMBRE = valor(CFG, "nombre", "objetivo")
+sea LIMITE_MS = valor(CFG, "limite_ms", 2000)
+sea MINUTOS = valor(CFG, "minutos", 30)
+sea SALIDA = valor(CFG, "salida", "fuzzlab-salida")
+sea CARPETA = valor(CFG, "carpeta", ".")
+sea EXCEPCIONES = valor(CFG, "excepciones_son_fallas", falso)
+sea PATRONES_EXTRA = valor(CFG, "patrones_falla", [])
+sea CODIGOS_EXTRA = valor(CFG, "codigos_falla", [])
+
+sea T = "/tmp/fuzzlab-" + tiempo_ms() + "-" + azar(100000)
+crear_carpeta(T)
+crear_carpeta(T + "/cov")
+crear_carpeta(T + "/canario")
+crear_carpeta(SALIDA)
+crear_carpeta(SALIDA + "/fallas")
+crear_carpeta(SALIDA + "/corpus")
+
+// Canario de inyección de comandos: si el objetivo llega a ejecutar
+// "fl_canario_cmd", este programa deja una marca.
+sea MARCA_CANARIO = T + "/canario_disparado"
+escribir_archivo(T + "/canario/fl_canario_cmd", "#!/bin/sh\ntouch " + comillas(MARCA_CANARIO) + "\n")
+sistema_comando("chmod +x " + comillas(T + "/canario/fl_canario_cmd"))
+
+// El comando del objetivo va en un guion: @@ es el archivo de entrada.
+sea ENTRADA = T + "/entrada.bin"
+sea cmd = CFG["comando"]
+si (texto_indice(cmd, "@@") >= 0) {
+    cmd = texto_reemplazar(cmd, "@@", comillas(ENTRADA))
+} sino {
+    cmd = cmd + " < " + comillas(ENTRADA)
+}
+escribir_archivo(T + "/correr.sh", "cd " + comillas(CARPETA) + " || exit 125\nexec " + cmd + "\n")
+
+sea SEG = piso((LIMITE_MS + 999) / 1000)
+sea LINEA = "rm -f " + comillas(T + "/cov") + "/*.sancov " + comillas(MARCA_CANARIO) + "; " +
+    "ASAN_OPTIONS=coverage=1:coverage_dir=" + comillas(T + "/cov") + ":detect_leaks=1:abort_on_error=0:symbolize=1 " +
+    "UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 " +
+    "PATH=" + comillas(T + "/canario") + ":\"$PATH\" " +
+    "timeout -s KILL " + SEG + " sh " + comillas(T + "/correr.sh") +
+    " > " + comillas(T + "/out") + " 2> " + comillas(T + "/err") + "; echo $?"
+
+// ── Ejecución ───────────────────────────────────────────────────────────
+
+sea EJECUCIONES = 0
+
+funcion ejecutar(datos) {
+    escribir_archivo(ENTRADA, datos)
+    sea t0 = tiempo_ms()
+    sea codigo = a_numero(recortar(sistema_comando(LINEA)))
+    sea ms = tiempo_ms() - t0
+    EJECUCIONES += 1
+    sea r = {"codigo": codigo, "ms": ms, "out": "", "err": "", "canario": existe_archivo(MARCA_CANARIO)}
+    intentar { r["out"] = subtexto(leer_archivo(T + "/out"), 0, 4096) } capturar (e) { }
+    intentar {
+        sea err = leer_archivo(T + "/err")
+        si (longitud(err) > 20000) { err = subtexto(err, 0, 20000) }
+        r["err"] = err
+    } capturar (e) { }
+    si (codigo == 137 y ms >= LIMITE_MS) {
+        // Cerrar procesos hijos que hayan quedado vivos.
+        sistema_comando("pkill -9 -f " + comillas(T) + " 2>/dev/null")
+    }
+    retornar r
+}
+
+funcion nombre_senal(n) {
+    si (n == 4) { retornar "instrucción ilegal (SIGILL)" }
+    si (n == 6) { retornar "abort (SIGABRT)" }
+    si (n == 7) { retornar "error de bus (SIGBUS)" }
+    si (n == 8) { retornar "coma flotante (SIGFPE)" }
+    si (n == 9) { retornar "matado (SIGKILL, sin memoria)" }
+    si (n == 11) { retornar "segfault (SIGSEGV)" }
+    retornar "señal " + n
+}
+
+sea PATRONES_SANITIZADOR = [
+    ["AddressSanitizer", "ASan"], ["LeakSanitizer", "fuga de memoria (LSan)"],
+    ["ThreadSanitizer", "carrera de datos (TSan)"], ["MemorySanitizer", "memoria sin iniciar (MSan)"],
+    ["runtime error:", "comportamiento indefinido (UBSan)"], ["stack overflow", "desbordamiento de pila"]
+]
+sea PATRONES_EXCEPCION = [["Traceback (most recent call last)", "excepción sin atrapar (Python)"],
+    ["panicked at", "pánico (Rust)"], ["Uncaught ", "excepción sin atrapar (JavaScript)"],
+    ["Exception in thread", "excepción sin atrapar (Java)"], ["Unhandled exception", "excepción sin atrapar (.NET)"],
+    ["Fatal error:", "error fatal (Swift/PHP)"], ["goroutine ", "pánico (Go)"]]
+sea PATRONES_SQL = ["SQL syntax", "sqlite3.OperationalError", "unterminated quoted", "unrecognized token", "SQLITE_ERROR", "ORA-0", "PG::", "SQLSTATE"]
+
+// Primera línea útil del informe de un sanitizador o error: la que dice
+// en qué función pasó ("#0 … in funcion archivo:línea" o "at …").
+funcion lugar(err) {
+    // 1) Marcos de pila "#N 0x… in funcion archivo:línea" (sanitizadores):
+    //    el primero con archivo fuente propio (no del sanitizador ni de la
+    //    libc); si ninguno tiene fuente, el primero que no sea interno.
+    sea sin_fuente = ""
+    para l en texto_dividir(err, "\n") {
+        sea s = recortar(l)
+        si (empieza(s, "#") y texto_indice(s, " in ") >= 0) {
+            sea resto = subtexto(s, texto_indice(s, " in ") + 4, longitud(s))
+            sea interno = texto_indice(resto, "asan") >= 0 o texto_indice(resto, "interceptor") >= 0 o texto_indice(resto, "sanitizer") >= 0 o texto_indice(resto, "compiler-rt") >= 0 o texto_indice(resto, "sysdeps") >= 0 o texto_indice(resto, "libc") >= 0
+            si (no interno) {
+                si (texto_indice(resto, "+0x") < 0 y texto_indice(resto, ":") >= 0) { retornar normalizar(resto) }
+                si (sin_fuente == "") { sin_fuente = normalizar(resto) }
+            }
+        }
+    }
+    si (sin_fuente != "") { retornar sin_fuente }
+    // 2) Otros lenguajes: "File …" (Python), "at …" (Java, JS, Go, Rust).
+    para l en texto_dividir(err, "\n") {
+        sea s = recortar(l)
+        si (empieza(s, "File \"") o empieza(s, "at ") o texto_indice(s, ".go:") >= 0 o texto_indice(s, ".rs:") >= 0) { retornar normalizar(s) }
+    }
+    retornar ""
+}
+
+// Qué clase de error dice el sanitizador (heap-buffer-overflow, use-after-free…).
+funcion clase_error(err, patron) {
+    para l en texto_dividir(err, "\n") {
+        sea p = texto_indice(l, patron)
+        si (p >= 0) {
+            sea resto = recortar(subtexto(l, p + longitud(patron), longitud(l)))
+            si (empieza(resto, ": ")) { resto = subtexto(resto, 2, longitud(resto)) }
+            sea fin = texto_indice(resto, " on ")
+            si (fin < 0) { fin = texto_indice(resto, " at ") }
+            si (fin > 0) { resto = subtexto(resto, 0, fin) }
+            retornar normalizar(subtexto(resto, 0, minimo(longitud(resto), 60)))
+        }
+    }
+    retornar ""
+}
+
+funcion primera_linea(err) {
+    para l en texto_dividir(err, "\n") {
+        si (longitud(recortar(l)) > 0) { retornar normalizar(recortar(l)) }
+    }
+    retornar ""
+}
+
+// Devuelve nulo si no es falla, o {"tipo", "firma", "detalle"}.
+funcion clasificar(r) {
+    sea c = r["codigo"]
+    sea err = r["err"]
+    si (r["canario"]) {
+        retornar {"tipo": "inyección de comandos", "firma": "inyeccion-comandos", "detalle": "el programa ejecutó un comando que venía en la entrada"}
+    }
+    si (c == 137 y r["ms"] >= LIMITE_MS) {
+        retornar {"tipo": "cuelgue", "firma": "cuelgue", "detalle": "no terminó en " + LIMITE_MS + " ms"}
+    }
+    para p en PATRONES_SANITIZADOR {
+        si (texto_indice(err, p[0]) >= 0) {
+            sea l = lugar(err)
+            sea clase = clase_error(err, p[0])
+            sea tipo = p[1]
+            si (clase != "") { tipo = p[1] + ": " + clase }
+            sea donde = ""
+            si (l != "") { donde = "en " + l }
+            retornar {"tipo": tipo, "firma": tipo + "|" + l, "detalle": donde}
+        }
+    }
+    si (EXCEPCIONES) {
+        para p en PATRONES_EXCEPCION {
+            si (texto_indice(err, p[0]) >= 0) {
+                sea ultima = ""
+                para linea en texto_dividir(err, "\n") { si (longitud(recortar(linea)) > 0) { ultima = normalizar(recortar(linea)) } }
+                retornar {"tipo": p[1], "firma": p[1] + "|" + ultima, "detalle": ultima}
+            }
+        }
+    }
+    para p en PATRONES_EXTRA {
+        si (texto_indice(err, p) >= 0) { retornar {"tipo": "patrón de falla: " + p, "firma": "patron|" + p + "|" + lugar(err), "detalle": primera_linea(err)} }
+    }
+    // Un error de sintaxis SQL provocado por la entrada = la entrada llega
+    // armada dentro de la consulta (inyección SQL).
+    sea todo = r["out"] + err
+    para p en PATRONES_SQL {
+        si (texto_indice(todo, p) >= 0) {
+            retornar {"tipo": "posible inyección SQL", "firma": "sql|" + p, "detalle": "un texto de la entrada rompió una consulta SQL (" + p + ")"}
+        }
+    }
+    si (texto_indice(err, "fl_canario_ruta") >= 0 y (texto_indice(err, "No such file") >= 0 o texto_indice(err, "ENOENT") >= 0 o texto_indice(err, "FileNotFound") >= 0)) {
+        retornar {"tipo": "posible recorrido de rutas", "firma": "rutas", "detalle": "el programa intentó abrir una ruta que venía en la entrada"}
+    }
+    si (c > 128 y c != 137) {
+        retornar {"tipo": nombre_senal(c - 128), "firma": "senal" + (c - 128) + "|" + lugar(err), "detalle": primera_linea(err)}
+    }
+    si (c == 137) {
+        retornar {"tipo": nombre_senal(9), "firma": "senal9", "detalle": "el sistema cerró el programa (posible exceso de memoria)"}
+    }
+    para k en CODIGOS_EXTRA {
+        si (c == k) { retornar {"tipo": "código de salida " + c, "firma": "codigo" + c + "|" + primera_linea(err), "detalle": primera_linea(err)} }
+    }
+    retornar nulo
+}
+
+// ── Señal de progreso: cobertura real o comportamiento ─────────────────
+
+sea MODO_COBERTURA = "comportamiento"
+
+// Lista de "rasgos" de una ejecución: direcciones de código recorridas
+// (sancov) y rasgos de comportamiento.
+funcion rasgos(r) {
+    sea l = []
+    para f en listar_carpeta(T + "/cov") {
+        si (texto_indice(f, ".sancov") > 0) {
+            MODO_COBERTURA = "cobertura real (sancov)"
+            sea d = ""
+            intentar { d = leer_archivo(T + "/cov/" + f) } capturar (e) { }
+            // Cabecera de 8 bytes y luego direcciones de 8 bytes (o 4).
+            sea paso = 8
+            si (longitud(d) >= 8 y byte_en(d, 0) == 50) { paso = 4 }   // magia ...32
+            sea i = 8
+            mientras (i + paso <= longitud(d)) {
+                agregar(l, subtexto(d, i, i + paso))
+                i += paso
+            }
+        }
+    }
+    agregar(l, "c" + r["codigo"])
+    agregar(l, "o" + log2(longitud(r["out"]) + 1))
+    agregar(l, "t" + log2(r["ms"] + 1))
+    sea k = 0
+    para linea en texto_dividir(r["err"], "\n") {
+        si (k < 6 y longitud(recortar(linea)) > 0) {
+            agregar(l, "e" + normalizar(subtexto(recortar(linea), 0, minimo(longitud(recortar(linea)), 60))))
+            k += 1
+        }
+    }
+    retornar l
+}
+
+sea VISTOS = {}          // rasgo → veces visto
+sea CORPUS = []          // {"d": datos, "nuevos": cuántos rasgos aportó}
+
+// Agrega la entrada al corpus si logró algún rasgo nunca visto.
+funcion aprender(datos, r) {
+    sea nuevos = 0
+    para f en rasgos(r) {
+        si (tiene_clave(VISTOS, f)) {
+            VISTOS[f] = VISTOS[f] + 1
+        } sino {
+            VISTOS[f] = 1
+            nuevos += 1
+        }
+    }
+    si (nuevos > 0 y longitud(datos) <= 1000000) {
+        agregar(CORPUS, {"d": datos, "nuevos": nuevos, "elegida": 0})
+        retornar verdadero
+    }
+    retornar falso
+}
+
+// Elige una base: prefiere entradas recientes, chicas y que aportaron
+// mucho, y que aún no se han explotado tanto.
+funcion elegir_base() {
+    sea mejor = nulo
+    sea puntaje_mejor = -1
+    sea k = 0
+    mientras (k < 4) {
+        sea i = azar(longitud(CORPUS))
+        si (azar(2) == 0 y longitud(CORPUS) > 8) { i = longitud(CORPUS) - 1 - azar(8) }
+        sea e = CORPUS[i]
+        sea p = (e["nuevos"] + 1) * 1000 / ((e["elegida"] + 1) * (log2(longitud(e["d"]) + 1) + 1))
+        si (p > puntaje_mejor) {
+            puntaje_mejor = p
+            mejor = e
+        }
+        k += 1
+    }
+    mejor["elegida"] = mejor["elegida"] + 1
+    retornar mejor["d"]
+}
+
+// ── Mutaciones (havoc) ──────────────────────────────────────────────────
+
+sea INTERESANTES_8 = [0, 1, 16, 32, 64, 100, 127, 128, 255]
+sea INTERESANTES_TXT = ["0", "-1", "1", "255", "256", "65535", "65536", "2147483647", "-2147483648", "4294967295",
+    "9223372036854775807", "-9223372036854775808", "1e308", "NaN", "Infinity", "-0", "0x7fffffff", "99999999999999999999999"]
+sea CARGAS = [";fl_canario_cmd;", "$(fl_canario_cmd)", "`fl_canario_cmd`", "|fl_canario_cmd", "&&fl_canario_cmd", "\nfl_canario_cmd\n",
+    "'fl_canario\"", "' OR '1'='1fl_canario", "\" fl_canario", "../../../../../../fl_canario_ruta", "/../../fl_canario_ruta",
+    "%s%s%s%n%x", "%999999999d", "{{7*7}}fl_canario", "${7*7}fl_canario", "<script>fl_canario</script>",
+    char_de(0), char_de(255) + char_de(254), char_de(192) + char_de(128), char_de(237) + char_de(160) + char_de(128)]
+
+sea DICCIONARIO = []
+para p en valor(CFG, "diccionario", []) { agregar(DICCIONARIO, p) }
+para p en CARGAS { agregar(DICCIONARIO, p) }
+para p en INTERESANTES_TXT { agregar(DICCIONARIO, p) }
+
+// Palabras automáticas: trozos imprimibles de las semillas (como un
+// diccionario aprendido del formato).
+funcion aprender_palabras(datos) {
+    sea actual = []
+    sea vistas = 0
+    sea i = 0
+    mientras (i < longitud(datos) y i < 20000 y vistas < 40) {
+        sea b = byte_en(datos, i)
+        si ((b >= 48 y b <= 57) o (b >= 65 y b <= 90) o (b >= 97 y b <= 122) o b == 95 o b == 60 o b == 62 o b == 47 o b == 58 o b == 45) {
+            agregar(actual, char_de(b))
+        } sino {
+            si (longitud(actual) >= 3 y longitud(actual) <= 24) {
+                agregar(DICCIONARIO, texto_unir(actual, ""))
+                vistas += 1
+            }
+            actual = []
+        }
+        i += 1
+    }
+}
+
+funcion poner_byte(d, i, b) { retornar subtexto(d, 0, i) + char_de(b) + subtexto(d, i + 1, longitud(d)) }
+funcion insertar(d, i, t) { retornar subtexto(d, 0, i) + t + subtexto(d, i, longitud(d)) }
+funcion sobrescribir(d, i, t) {
+    sea fin = minimo(longitud(d), i + longitud(t))
+    retornar subtexto(d, 0, i) + t + subtexto(d, fin, longitud(d))
+}
+
+funcion mutar_una(d) {
+    sea n = longitud(d)
+    sea tipo = azar(16)
+    si (n == 0) { tipo = 9 }
+    sea i = azar(n + 1)
+    si (i >= n y n > 0) { i = n - 1 }
+    si (tipo == 0) { retornar poner_byte(d, i, bits_xo(byte_en(d, i), elegir([1, 2, 4, 8, 16, 32, 64, 128]))) }                 // voltear un bit
+    si (tipo == 1) { retornar poner_byte(d, i, elegir(INTERESANTES_8)) }                                  // valor límite
+    si (tipo == 2) { retornar poner_byte(d, i, (byte_en(d, i) + 1 + azar(35)) % 256) }                    // aritmética
+    si (tipo == 3) { retornar poner_byte(d, i, (byte_en(d, i) + 256 - 1 - azar(35)) % 256) }
+    si (tipo == 4) { retornar poner_byte(d, i, azar(256)) }                                               // byte al azar
+    si (tipo == 5 y n > 1) {                                                                              // borrar bloque
+        sea largo = 1 + azar(minimo(n - i, 64))
+        retornar subtexto(d, 0, i) + subtexto(d, i + largo, n)
+    }
+    si (tipo == 6 y n > 0) {                                                                              // duplicar bloque
+        sea largo = 1 + azar(minimo(n - i, 64))
+        retornar insertar(d, i, texto_repetir(subtexto(d, i, i + largo), 1 + azar(4)))
+    }
+    si (tipo == 7) { retornar insertar(d, i, elegir(DICCIONARIO)) }                                      // palabra del diccionario
+    si (tipo == 8) { retornar sobrescribir(d, i, elegir(DICCIONARIO)) }
+    si (tipo == 9) { retornar insertar(d, i, elegir(DICCIONARIO)) }
+    si (tipo == 10) { retornar insertar(d, i, texto_repetir(char_de(azar(256)), 1 + azar(128))) }       // repetir un byte
+    si (tipo == 11 y longitud(CORPUS) > 1) {                                                             // cruzar con otra entrada
+        sea otra = elegir(CORPUS)["d"]
+        sea j = azar(longitud(otra) + 1)
+        retornar subtexto(d, 0, i) + subtexto(otra, j, longitud(otra))
+    }
+    si (tipo == 12 y n > 0) { retornar subtexto(d, 0, i) }                                               // cortar
+    si (tipo == 13) { retornar insertar(d, i, elegir(INTERESANTES_TXT)) }                               // número límite
+    si (tipo == 14 y n > 2) {                                                                             // anidar / repetir trozo grande
+        sea largo = 1 + azar(minimo(n - i, 16))
+        retornar insertar(d, i, texto_repetir(subtexto(d, i, i + largo), 50 + azar(500)))
+    }
+    retornar poner_byte(d, i, azar(256))
+}
+
+funcion mutar(d) {
+    sea veces = elegir([1, 2, 4, 8, 16])
+    sea k = 0
+    mientras (k < veces) {
+        d = mutar_una(d)
+        k += 1
+    }
+    si (longitud(d) > 1000000) { d = subtexto(d, 0, 1000000) }
+    retornar d
+}
+
+// ── Fallas: reducir, agrupar y guardar ──────────────────────────────────
+
+sea FALLAS = {}          // firma → {"tipo", "detalle", "archivo", "veces", "bytes"}
+sea N_FALLAS = 0
+
+// Reduce la entrada quitando bloques (cada vez más chicos) mientras siga
+// dando la misma firma. Máximo 400 ejecuciones.
+funcion reducir(datos, firma) {
+    sea presupuesto = 400
+    sea paso = piso(longitud(datos) / 2)
+    mientras (paso >= 1 y presupuesto > 0) {
+        sea i = 0
+        sea quito = falso
+        mientras (i < longitud(datos) y presupuesto > 0) {
+            sea cand = subtexto(datos, 0, i) + subtexto(datos, i + paso, longitud(datos))
+            presupuesto -= 1
+            sea f = clasificar(ejecutar(cand))
+            si (f != nulo y f["firma"] == firma) {
+                datos = cand
+                quito = verdadero
+            } sino {
+                i += paso
+            }
+        }
+        si (no quito) { paso = piso(paso / 2) }
+    }
+    retornar datos
+}
+
+funcion registrar(datos, f) {
+    si (tiene_clave(FALLAS, f["firma"])) {
+        FALLAS[f["firma"]]["veces"] = FALLAS[f["firma"]]["veces"] + 1
+        retornar nulo
+    }
+    N_FALLAS += 1
+    sea antes = longitud(datos)
+    sea min = datos
+    si (f["firma"] != "cuelgue") { min = reducir(datos, f["firma"]) }
+    sea archivo = "fallas/falla-" + N_FALLAS + ".bin"
+    escribir_archivo(SALIDA + "/" + archivo, min)
+    FALLAS[f["firma"]] = {"tipo": f["tipo"], "detalle": f["detalle"], "archivo": archivo, "veces": 1, "bytes": longitud(min), "antes": antes}
+    mostrar("  ✗ " + f["tipo"] + " — " + f["detalle"] + " (" + antes + " → " + longitud(min) + " bytes)")
+}
+
+// ── Memoria de fallas: ¿siguen fallando las de corridas anteriores? ─────
+
+sea REGRESIONES = []
+si (existe_archivo(SALIDA + "/fallas.json")) {
+    intentar {
+        sea previas = cfv_json_parsear(leer_archivo(SALIDA + "/fallas.json"))
+        para p en previas {
+            sea ruta = SALIDA + "/" + p["archivo"]
+            si (existe_archivo(ruta)) {
+                sea f = clasificar(ejecutar(leer_archivo(ruta)))
+                sea estado = "arreglada"
+                si (f != nulo) { estado = "sigue" }
+                agregar(REGRESIONES, {"estado": estado, "tipo": p["tipo"], "detalle": p["detalle"]})
+            }
+        }
+    } capturar (e) { mostrar("  (no se pudieron leer las fallas anteriores: " + e + ")") }
+    // Los archivos se renumeran en esta corrida.
+    para f en listar_carpeta(SALIDA + "/fallas") { eliminar_archivo(SALIDA + "/fallas/" + f) }
+}
+
+// Palabras del propio programa atacado: cada archivo que aparece en el
+// comando (el ejecutable, el script…) se lee y se sacan sus textos. Así
+// aparecen cabeceras mágicas y palabras clave sin adivinarlas a ciegas.
+funcion palabras_de_binario(ruta) {
+    sea d = ""
+    intentar { d = leer_archivo(ruta) } capturar (e) { retornar nulo }
+    sea actual = []
+    sea vistas = 0
+    sea i = 0
+    sea n = minimo(longitud(d), 4000000)
+    mientras (i < n y vistas < 400) {
+        sea b = byte_en(d, i)
+        si (b >= 32 y b <= 126) {
+            agregar(actual, char_de(b))
+        } sino {
+            si (longitud(actual) >= 3 y longitud(actual) <= 20) {
+                agregar(DICCIONARIO, texto_unir(actual, ""))
+                vistas += 1
+            }
+            actual = []
+        }
+        i += 1
+    }
+}
+para parte en texto_dividir(CFG["comando"], " ") {
+    sea ruta = parte
+    si (no empieza(ruta, "/")) { ruta = CARPETA + "/" + parte }
+    si (parte != "@@" y existe_archivo(ruta) y no es_carpeta(ruta)) { palabras_de_binario(ruta) }
+}
+
+sea INICIO = tiempo_ms()
+sea FIN = INICIO + MINUTOS * 60000
+sea ultimo_aviso = INICIO
+
+// ── Semillas ────────────────────────────────────────────────────────────
+
+sea SEMILLAS = valor(CFG, "semillas", "")
+sea n_semillas = 0
+funcion probar_semilla(d) {
+    sea r = ejecutar(d)
+    aprender(d, r)
+    sea f = clasificar(r)
+    si (f != nulo) { registrar(d, f) }
+}
+// El corpus guardado de corridas anteriores también sirve de semilla.
+para carpeta en [SEMILLAS, SALIDA + "/corpus"] {
+    si (carpeta != "" y existe_archivo(carpeta) y es_carpeta(carpeta)) {
+        para f en listar_carpeta(carpeta) {
+            sea ruta = carpeta + "/" + f
+            si (no es_carpeta(ruta)) {
+                sea d = leer_archivo(ruta)
+                aprender_palabras(d)
+                probar_semilla(d)
+                n_semillas += 1
+            }
+        }
+    }
+}
+si (longitud(CORPUS) == 0) {
+    probar_semilla("")
+    probar_semilla("a")
+    probar_semilla("{\"a\": [1, \"b\"]}")
+    probar_semilla("<a b=\"1\">x</a>")
+}
+si (longitud(CORPUS) == 0) { agregar(CORPUS, {"d": "a", "nuevos": 1, "elegida": 0}) }
+
+// Barrido determinista (como la etapa determinista de los fuzzers
+// clásicos): para entradas nuevas y chicas, prueba cada carácter
+// imprimible y cada valor límite en sus primeras posiciones. Encuentra
+// los "candados" de un byte (versiones, separadores, banderas).
+sea BARRIDAS = 0
+sea VALORES_BARRIDO = []
+para v en rango(32, 127) { agregar(VALORES_BARRIDO, v) }
+para v en [0, 1, 9, 10, 13, 127, 128, 255] { agregar(VALORES_BARRIDO, v) }
+funcion barrer(d) {
+    BARRIDAS += 1
+    sea posiciones = minimo(longitud(d), 12)
+    sea i = 0
+    mientras (i < posiciones y tiempo_ms() < FIN) {
+        para v en VALORES_BARRIDO {
+            si (byte_en(d, i) != v) {
+                sea cand = poner_byte(d, i, v)
+                sea r = ejecutar(cand)
+                si (aprender(cand, r)) { nulo }
+                sea f = clasificar(r)
+                si (f != nulo) { registrar(cand, f) }
+            }
+        }
+        i += 1
+    }
+}
+
+// Inyección dirigida (como los detectores de Jazzer): a cada entrada
+// nueva le prueba cada carga peligrosa en los puntos donde suele
+// terminar un valor: al final, después de espacios, "=", ":", "&", ","
+// y comillas, y reemplazando el último valor.
+sea CARGAS_TEXTO = []
+para c en CARGAS { si (longitud(c) > 3) { agregar(CARGAS_TEXTO, c) } }
+funcion inyectar(d) {
+    sea puntos = [longitud(d)]
+    sea i = 0
+    mientras (i < longitud(d) y longitud(puntos) < 8) {
+        sea b = byte_en(d, i)
+        si (b == 32 o b == 61 o b == 58 o b == 38 o b == 44 o b == 34 o b == 39 o b == 10) { agregar(puntos, i + 1) }
+        i += 1
+    }
+    para carga en CARGAS_TEXTO {
+        si (tiempo_ms() >= FIN) { retornar nulo }
+        sea candidatos = []
+        para p en puntos { agregar(candidatos, insertar(d, p, carga)) }
+        sea ultimo = -1
+        sea k = 0
+        mientras (k < longitud(d)) {
+            si (byte_en(d, k) == 32 o byte_en(d, k) == 61) { ultimo = k }
+            k += 1
+        }
+        si (ultimo >= 0) { agregar(candidatos, subtexto(d, 0, ultimo + 1) + carga) }
+        para cand en candidatos {
+            sea r = ejecutar(cand)
+            aprender(cand, r)
+            sea f = clasificar(r)
+            si (f != nulo) { registrar(cand, f) }
+        }
+    }
+}
+sea INYECTADAS = 0
+
+// ── Bucle principal ─────────────────────────────────────────────────────
+
+mostrar("🔬 Fuzz Lab Universal · " + NOMBRE + " · " + n_semillas + " semillas · " + longitud(DICCIONARIO) + " palabras de diccionario")
+
+mientras (tiempo_ms() < FIN) {
+    // Primero barrer las entradas nuevas chicas (máximo 30 barridos).
+    sea pendiente = nulo
+    si (BARRIDAS < 30) {
+        para e en CORPUS {
+            si (pendiente == nulo y longitud(e["d"]) <= 64 y no tiene_clave(e, "barrida")) { pendiente = e }
+        }
+    }
+    si (pendiente != nulo) {
+        pendiente["barrida"] = verdadero
+        barrer(pendiente["d"])
+    }
+    si (INYECTADAS < 20) {
+        sea sin_inyectar = nulo
+        para e en CORPUS {
+            si (sin_inyectar == nulo y longitud(e["d"]) <= 4096 y no tiene_clave(e, "inyectada")) { sin_inyectar = e }
+        }
+        si (sin_inyectar != nulo) {
+            sin_inyectar["inyectada"] = verdadero
+            INYECTADAS += 1
+            inyectar(sin_inyectar["d"])
+        }
+    }
+    sea d = mutar(elegir_base())
+    sea r = ejecutar(d)
+    aprender(d, r)
+    sea f = clasificar(r)
+    si (f != nulo) { registrar(d, f) }
+    si (tiempo_ms() - ultimo_aviso > 30000) {
+        ultimo_aviso = tiempo_ms()
+        sea seg = (ultimo_aviso - INICIO) / 1000
+        mostrar("  " + piso(seg) + " s · " + EJECUCIONES + " ejecuciones (" + piso(EJECUCIONES / (seg + 1)) + "/s) · corpus " + longitud(CORPUS) + " · rasgos " + longitud(mapa_claves(VISTOS)) + " · fallas " + N_FALLAS + " · " + MODO_COBERTURA)
+    }
+}
+
+// ── Reducir el corpus: las entradas más chicas que cubren todo ──────────
+
+funcion por_tamano(a, b) { retornar longitud(a["d"]) - longitud(b["d"]) }
+sea cubiertos = {}
+sea final = []
+para e en ordenar(CORPUS, por_tamano) {
+    sea r = ejecutar(e["d"])
+    sea aporta = falso
+    para f en rasgos(r) {
+        si (no tiene_clave(cubiertos, f)) {
+            cubiertos[f] = verdadero
+            aporta = verdadero
+        }
+    }
+    si (aporta) { agregar(final, e["d"]) }
+}
+para f en listar_carpeta(SALIDA + "/corpus") { eliminar_archivo(SALIDA + "/corpus/" + f) }
+sea k = 0
+para d en final {
+    escribir_archivo(SALIDA + "/corpus/" + cfv_sha256(d) + ".bin", d)
+    k += 1
+}
+
+// ── Reporte ─────────────────────────────────────────────────────────────
+
+sea lista = []
+para firma en mapa_claves(FALLAS) {
+    sea x = FALLAS[firma]
+    agregar(lista, {"firma": firma, "tipo": x["tipo"], "detalle": x["detalle"], "archivo": x["archivo"], "veces": x["veces"], "bytes": x["bytes"]})
+}
+escribir_archivo(SALIDA + "/fallas.json", json_bonito(lista))
+
+sea seg_total = (tiempo_ms() - INICIO) / 1000
+sea rep = []
+agregar(rep, "# 🔬 Reporte Fuzz Lab Universal · " + NOMBRE)
+agregar(rep, "")
+agregar(rep, "- **Comando:** `" + CFG["comando"] + "`")
+agregar(rep, "- **Duración:** " + piso(seg_total / 60) + " min · " + EJECUCIONES + " ejecuciones (" + piso(EJECUCIONES / (seg_total + 1)) + " por segundo)")
+agregar(rep, "- **Señal de progreso:** " + MODO_COBERTURA + " · " + longitud(mapa_claves(VISTOS)) + " rasgos distintos")
+agregar(rep, "- **Corpus:** " + longitud(CORPUS) + " entradas interesantes, reducidas a " + longitud(final) + " (carpeta `corpus/`)")
+agregar(rep, "- **Fallas únicas:** " + longitud(lista))
+si (longitud(REGRESIONES) > 0) {
+    sea arr = 0
+    para g en REGRESIONES { si (g["estado"] == "arreglada") { arr += 1 } }
+    agregar(rep, "- **Fallas anteriores:** " + arr + " ✅ arregladas · " + (longitud(REGRESIONES) - arr) + " 🔴 siguen")
+}
+agregar(rep, "")
+si (longitud(lista) == 0) {
+    agregar(rep, "✅ Sin fallas en esta corrida.")
+} sino {
+    agregar(rep, "## Fallas")
+    agregar(rep, "")
+    para x en lista {
+        agregar(rep, "### " + x["tipo"])
+        agregar(rep, "")
+        agregar(rep, "- **Detalle:** " + x["detalle"])
+        agregar(rep, "- **Veces:** " + x["veces"] + " · **Entrada mínima:** `" + x["archivo"] + "` (" + x["bytes"] + " bytes)")
+        agregar(rep, "")
+    }
+}
+si (longitud(REGRESIONES) > 0) {
+    agregar(rep, "## 🔁 Fallas anteriores")
+    agregar(rep, "")
+    agregar(rep, "| Estado | Tipo | Detalle |")
+    agregar(rep, "|---|---|---|")
+    para g en REGRESIONES {
+        sea e = "🔴 sigue"
+        si (g["estado"] == "arreglada") { e = "✅ arreglada" }
+        agregar(rep, "| " + e + " | " + g["tipo"] + " | " + texto_reemplazar(g["detalle"], "|", "/") + " |")
+    }
+    agregar(rep, "")
+}
+agregar(rep, "## Cómo reproducir")
+agregar(rep, "")
+agregar(rep, "Ejecuta el comando del objetivo con la entrada mínima de cada falla (en lugar de `@@` o por la entrada estándar).")
+escribir_archivo(SALIDA + "/REPORTE.md", texto_unir(rep, "\n") + "\n")
+
+sistema_comando("rm -rf " + comillas(T))
+mostrar("")
+mostrar("  Reporte: " + SALIDA + "/REPORTE.md (" + longitud(lista) + " fallas únicas, " + EJECUCIONES + " ejecuciones)")
+si (longitud(lista) > 0) { salir(1) }
