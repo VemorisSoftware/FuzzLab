@@ -13,6 +13,11 @@
 #   programas  programas de estrés generados (recursión, enteros, memoria…)
 #   mutaciones programas reales con mutaciones (compilador y ejecución)
 #   bytes      bytes aleatorios al compilador
+#   cruzadas   resultados incorrectos (propiedades que siempre deben cumplirse)
+#   rendimiento velocidad vs. la corrida anterior y vs. C   (una vez por corrida)
+#   memoria    fugas de memoria                            (una vez por corrida)
+#
+# BASE_RENDIMIENTO (opcional): archivo con los tiempos de la corrida anterior.
 #
 # Una falla es: cierre por señal (segfault, abort, sin memoria), cuelgue
 # (pasa el tiempo límite) o un error que intentar/capturar no atrapó.
@@ -35,9 +40,12 @@ INICIO=$(date +%s)
 [ -x "$C" ] || { echo "Falta $C: corre 'make build' primero."; exit 2; }
 "$C" build "$LAB/ataques_stdlib.cfv" -o "$T/ataques" >/dev/null || exit 2
 "$C" build "$LAB/generador.cfv" -o "$T/generador" >/dev/null || exit 2
+"$C" build "$LAB/cruzadas.cfv" -o "$T/cruzadas" >/dev/null || exit 2
+"$C" build "$LAB/fugas.cfv" -o "$T/fugas" >/dev/null || exit 2
+"$C" build "$LAB/rendimiento.cfv" -o "$T/bench" --release >/dev/null || exit 2
 
 : > "$SALIDA/fallas.tsv"          # firma \t motor \t tipo \t detalle \t archivo
-total_stdlib=0; total_prog=0; total_mut=0; total_bytes=0
+total_stdlib=0; total_prog=0; total_mut=0; total_bytes=0; total_cruz=0
 n_fallas=0
 
 tipo_de() {   # código de salida → tipo de falla ("" si no es falla)
@@ -64,6 +72,63 @@ registrar() {
 
 quedan() { [ "$(date +%s)" -lt "$FIN" ]; }
 
+# pico_kb SEGUNDOS CMD… → pico de memoria (KB) del proceso, o "cuelgue".
+pico_kb() {
+    limite=$1; shift
+    "$@" > /dev/null 2> "$T/pico.err" &
+    pid=$!
+    max=0; t=0
+    while kill -0 "$pid" 2>/dev/null; do
+        v=$(awk '/^VmHWM:/ {print $2}' "/proc/$pid/status" 2>/dev/null)
+        [ -n "$v" ] && [ "$v" -gt "$max" ] && max=$v
+        sleep 0.1; t=$((t + 1))
+        if [ "$t" -gt $((limite * 10)) ]; then kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; echo cuelgue; return; fi
+    done
+    codigo=0; wait "$pid" 2>/dev/null || codigo=$?
+    tipo=$(tipo_de "$codigo")
+    if [ -n "$tipo" ]; then echo "caida:$tipo"; else echo "$max"; fi
+}
+
+# ── Rendimiento (una vez por corrida) ───────────────────────────────────
+: > "$SALIDA/rendimiento.tsv"
+codigo=0
+timeout 1500 "$T/bench" > "$T/bench.out" 2>&1 || codigo=$?
+awk '$1 == "BENCH" {print $2 "\t" $3}' "$T/bench.out" > "$SALIDA/rendimiento.tsv"
+if [ "$codigo" -ne 0 ]; then
+    tipo=$(tipo_de "$codigo"); [ -z "$tipo" ] && tipo="error"
+    registrar "rendimiento|$tipo" rendimiento "$tipo en las pruebas de velocidad" "rendimiento.cfv terminó con código $codigo" "$LAB/rendimiento.cfv"
+fi
+: > "$SALIDA/rendimiento_c.tsv"
+if command -v gcc > /dev/null 2>&1 && gcc -O2 "$LAB/bench_c.c" -o "$T/bench_c" 2>/dev/null; then
+    "$T/bench_c" | awk '$1 == "BENCH" {print $2 "\t" $3}' > "$SALIDA/rendimiento_c.tsv"
+fi
+regresiones=0
+if [ -n "${BASE_RENDIMIENTO:-}" ] && [ -s "$BASE_RENDIMIENTO" ]; then
+    while IFS="$(printf '\t')" read -r nombre ms; do
+        base=$(awk -F '\t' -v n="$nombre" '$1 == n {print $2}' "$BASE_RENDIMIENTO")
+        [ -z "$base" ] && continue
+        if [ "$ms" -gt $(( base * 13 / 10 )) ] && [ $(( ms - base )) -ge 30 ]; then
+            regresiones=$((regresiones + 1))
+            registrar "lento|$nombre" rendimiento "más lento que antes" "$nombre: $base ms → $ms ms (+$(( (ms - base) * 100 / (base + 1) ))%)" ""
+        fi
+    done < "$SALIDA/rendimiento.tsv"
+fi
+
+# ── Memoria: fugas (una vez por corrida) ───────────────────────────────
+: > "$SALIDA/memoria.tsv"
+for escenario in listas textos mapas closures excepciones json objetos enteros; do
+    quedan || break
+    a=$(pico_kb 300 "$T/fugas" "$escenario" 1000)
+    b=$(pico_kb 900 "$T/fugas" "$escenario" 4000)
+    printf '%s\t%s\t%s\n' "$escenario" "$a" "$b" >> "$SALIDA/memoria.tsv"
+    case "$a$b" in
+        *cuelgue*|*caida*) registrar "memoria|$escenario|$a$b" memoria "falla en prueba de memoria" "escenario $escenario: 1000 rep. = $a, 4000 rep. = $b" "" ; continue ;;
+    esac
+    if [ "$b" -gt $((a * 2)) ] && [ $((b - a)) -gt 51200 ]; then
+        registrar "fuga|$escenario" memoria "posible fuga de memoria" "escenario $escenario: pico $((a / 1024)) MB con 1000 repeticiones → $((b / 1024)) MB con 4000" ""
+    fi
+done
+
 ronda=0
 while quedan; do
     ronda=$((ronda + 1))
@@ -89,6 +154,21 @@ while quedan; do
         total_stdlib=$((total_stdlib + caso - desde + 1))
         desde=$((caso + 1))
     done
+
+    # ── pruebas cruzadas (resultados incorrectos) ───────────────────────
+    if quedan; then
+        codigo=0
+        timeout 300 "$T/cruzadas" "$semilla" 300 > "$T/c.out" 2> "$T/c.err" || codigo=$?
+        total_cruz=$((total_cruz + 300))
+        grep '^FALLA ' "$T/c.out" > "$T/c.fallas" || true
+        while IFS= read -r l; do
+            prop=$(echo "$l" | sed 's/^FALLA \([^ |]*\).*/\1/')
+            printf '%s\n' "$l" > "$T/cruz.txt"
+            registrar "cruzadas|$prop" cruzadas "resultado incorrecto" "$(echo "$l" | cut -c7-400) (semilla $semilla)" "$T/cruz.txt"
+        done < "$T/c.fallas"
+        tipo=$(tipo_de "$codigo")
+        [ -n "$tipo" ] && registrar "cruzadas|$tipo" cruzadas "$tipo en pruebas cruzadas" "semilla $semilla $(head -c 120 "$T/c.err" | tr '\n\t' '  ')" ""
+    fi
 
     # ── programas de estrés ─────────────────────────────────────────────
     k=0
@@ -156,7 +236,7 @@ unicas=$(cut -f1 "$SALIDA/fallas.tsv" | sort -u | wc -l)
     echo "- **Versión:** $("$C" --version | head -1)"
     echo "- **Commit de C-Forge:** $(git -C "$RAIZ" rev-parse --short HEAD 2>/dev/null || echo '?')"
     echo "- **Duración:** $DUR min · $ronda rondas"
-    echo "- **Ataques:** $total_stdlib a la stdlib · $total_prog programas de estrés · $total_mut mutaciones · $total_bytes entradas de bytes"
+    echo "- **Ataques:** $total_stdlib a la stdlib · $total_cruz pruebas cruzadas · $total_prog programas de estrés · $total_mut mutaciones · $total_bytes entradas de bytes"
     echo "- **Fallas únicas:** $unicas"
     echo
     if [ "$unicas" -eq 0 ]; then
@@ -187,6 +267,27 @@ unicas=$(cut -f1 "$SALIDA/fallas.tsv" | sort -u | wc -l)
         echo "- programas y mutaciones: \`cforge casos/falla-N.cfv\` (o \`cforge check\`)"
         echo "- stdlib: la línea indica semilla y caso; la entrada exacta está en \`casos/falla-N.bin\`"
     fi
+    echo
+    echo "## ⚡ Rendimiento"
+    echo
+    echo "| Prueba | C-Forge (ms) | C -O2 (ms) | C-Forge / C | Corrida anterior (ms) |"
+    echo "|---|---|---|---|---|"
+    while IFS="$(printf '\t')" read -r nombre ms; do
+        c=$(awk -F '\t' -v n="$nombre" '$1 == n {print $2}' "$SALIDA/rendimiento_c.tsv" 2>/dev/null)
+        b=""; [ -n "${BASE_RENDIMIENTO:-}" ] && [ -s "$BASE_RENDIMIENTO" ] && b=$(awk -F '\t' -v n="$nombre" '$1 == n {print $2}' "$BASE_RENDIMIENTO")
+        r="—"; [ -n "$c" ] && r=$(awk -v a="$ms" -v b="$c" 'BEGIN { if (b < 1) b = 1; printf "%.1f×", a / b }')
+        echo "| $nombre | $ms | ${c:-—} | $r | ${b:-—} |"
+    done < "$SALIDA/rendimiento.tsv"
+    echo
+    echo "Una regresión es una prueba más de 30 % (y 30 ms) más lenta que la corrida anterior. Los tiempos de los servidores de GitHub varían un poco entre corridas."
+    echo
+    echo "## 💧 Memoria"
+    echo
+    echo "| Escenario | Pico con 1000 rep. (KB) | Pico con 4000 rep. (KB) |"
+    echo "|---|---|---|"
+    while IFS="$(printf '\t')" read -r e a b; do echo "| $e | $a | $b |"; done < "$SALIDA/memoria.tsv"
+    echo
+    echo "Si la memoria con 4000 repeticiones es más del doble (y más de 50 MB) que con 1000, se marca como posible fuga."
 } > "$SALIDA/REPORTE.md"
 
 echo

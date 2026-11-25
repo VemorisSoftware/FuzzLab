@@ -1,0 +1,124 @@
+// objetivos/cforge/rendimiento.cfv — Fuzz Lab de Vemoris · rendimiento.
+//
+// Mide cuánto tarda C-Forge en tareas típicas. El Fuzz Lab compara cada
+// corrida con la anterior (para detectar si C-Forge se puso más lento) y,
+// en las pruebas que tienen equivalente, contra C (bench_c.c).
+//
+//   cforge build rendimiento.cfv -o bench && ./bench
+//
+// Escribe "BENCH nombre milisegundos" por cada prueba.
+
+funcion medir(nombre, f) {
+    sea mejor = -1
+    sea r = 0
+    sea i = 0
+    mientras (i < 3) {
+        sea a = tiempo_ms()
+        r = f()
+        sea t = tiempo_ms() - a
+        si (mejor < 0 o t < mejor) { mejor = t }
+        i += 1
+    }
+    mostrar("BENCH " + nombre + " " + mejor)
+    retornar r
+}
+
+funcion fib(n) {
+    si (n < 2) { retornar n }
+    retornar fib(n - 1) + fib(n - 2)
+}
+
+// ── Con equivalente en C (mismo algoritmo en bench_c.c) ──────────────────────
+
+medir("fib30", funcion() { retornar fib(30) })
+
+medir("bucle_suma_10M", funcion() {
+    sea s = 0
+    sea i = 0
+    mientras (i < 10000000) {
+        s = s + (i % 7)
+        i += 1
+    }
+    retornar s
+})
+
+medir("criba_primos_2M", funcion() {
+    sea n = 2000000
+    sea marca = []
+    sea i = 0
+    mientras (i <= n) { marca.agregar(0) i += 1 }
+    sea cuenta = 0
+    sea p = 2
+    mientras (p <= n) {
+        si (marca[p] == 0) {
+            cuenta += 1
+            sea m = p * p
+            mientras (m <= n) { marca[m] = 1 m = m + p }
+        }
+        p += 1
+    }
+    retornar cuenta
+})
+
+medir("ordenar_200k", funcion() {
+    sea l = []
+    sea x = 12345
+    sea i = 0
+    mientras (i < 200000) {
+        x = (x * 1103515245 + 12345) % 2147483648
+        l.agregar(x)
+        i += 1
+    }
+    retornar longitud(ordenar(l))
+})
+
+// ── Solo C-Forge (para detectar si se pone más lento entre versiones) ───────
+
+medir("textos_concat_100k", funcion() {
+    sea t = ""
+    sea i = 0
+    mientras (i < 100000) { t = t + "ab" i += 1 }
+    retornar longitud(t)
+})
+
+medir("mapa_200k", funcion() {
+    sea m = {}
+    sea i = 0
+    mientras (i < 200000) { m["k" + i] = i i += 1 }
+    sea s = 0
+    i = 0
+    mientras (i < 200000) { s = s + m["k" + i] i += 1 }
+    retornar s
+})
+
+medir("json_ida_vuelta", funcion() {
+    sea datos = []
+    sea i = 0
+    mientras (i < 20000) { datos.agregar({"id": i, "nombre": "item" + i, "activo": verdadero, "tags": ["a", "b"]}) i += 1 }
+    retornar longitud(json_texto(cfv_json_parsear(json_texto(datos))))
+})
+
+medir("closures_1M", funcion() {
+    sea suma = 0
+    sea f = funcion(x) { retornar x + 1 }
+    sea i = 0
+    mientras (i < 1000000) { suma = f(suma) i += 1 }
+    retornar suma
+})
+
+medir("excepciones_100k", funcion() {
+    sea n = 0
+    sea i = 0
+    mientras (i < 100000) {
+        intentar { lanzar i } capturar (e) { n += 1 }
+        i += 1
+    }
+    retornar n
+})
+
+medir("enteros_gigantes", funcion() {
+    sea f = 1
+    sea i = 1
+    mientras (i <= 3000) { f = f * i i += 1 }
+    retornar longitud(a_texto(f))
+})

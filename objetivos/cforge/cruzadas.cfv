@@ -1,0 +1,208 @@
+// objetivos/cforge/cruzadas.cfv — Fuzz Lab de Vemoris · pruebas cruzadas.
+//
+// Busca RESULTADOS INCORRECTOS (no solo caídas): calcula lo mismo por dos
+// caminos o verifica propiedades que siempre deben cumplirse. Si no
+// coinciden, es un bug de C-Forge aunque el programa no se caiga.
+//
+//   cforge cruzadas.cfv SEMILLA CASOS
+//
+// Escribe "FALLA propiedad | detalle" por cada propiedad rota y al final
+// "FIN casos fallas".
+
+importar "base64"
+importar "compress"
+
+sea _estado = 1
+funcion sembrar(s) { _estado = (s % 2147483647) + 1 }
+funcion azar(n) {
+    _estado = (_estado * 48271) % 2147483647
+    si (n <= 0) { retornar 0 }
+    retornar _estado % n
+}
+funcion elegir(l) { retornar l[azar(longitud(l))] }
+
+// Enteros de todos los tamaños, incluidos los gigantes y los bordes de 64 bits.
+funcion entero_azar() {
+    sea tipo = azar(6)
+    si (tipo == 0) { retornar azar(10) - 5 }
+    si (tipo == 1) { retornar azar(2000000) - 1000000 }
+    si (tipo == 2) { retornar elegir([9223372036854775807, -9223372036854775807, 4294967296, -4294967296, 2147483647, -2147483648]) + azar(5) - 2 }
+    sea n = 1 + azar(9)
+    sea i = 0
+    mientras (i < 3 + azar(6)) {
+        n = n * (1000000007 + azar(1000))
+        i += 1
+    }
+    si (azar(2) == 0) { n = 0 - n }
+    retornar n
+}
+
+funcion texto_azar() {
+    sea piezas = ["a", "Z", "0", " ", ",", "ñ", "á", "🔥", "\n", "\"", "\\", "日本", "€", "-", "{", "}"]
+    sea r = ""
+    sea n = azar(40)
+    sea i = 0
+    mientras (i < n) {
+        r = r + elegir(piezas)
+        i += 1
+    }
+    retornar r
+}
+
+funcion bytes_azar(n) {
+    sea r = ""
+    sea i = 0
+    mientras (i < n) {
+        r = r + char_de(azar(256))
+        i += 1
+    }
+    retornar r
+}
+
+funcion valor_json(prof) {
+    sea t = azar(7)
+    si (prof > 3) { t = azar(4) }
+    si (t == 0) { retornar azar(1000000) - 500000 }
+    si (t == 1) { retornar texto_azar() }
+    si (t == 2) { retornar azar(2) == 0 }
+    si (t == 3) { retornar nulo }
+    si (t == 4) {
+        sea l = []
+        sea i = 0
+        mientras (i < azar(5)) { l.agregar(valor_json(prof + 1)) i += 1 }
+        retornar l
+    }
+    sea m = {}
+    sea i = 0
+    mientras (i < azar(5)) { m["k" + azar(100)] = valor_json(prof + 1) i += 1 }
+    retornar m
+}
+
+sea fallas = 0
+funcion revisar(nombre, ok, detalle) {
+    si (no ok) {
+        fallas += 1
+        sea d = "" + detalle
+        si (longitud(d) > 300) { d = texto_subcadena(d, 0, 300) + "…" }
+        mostrar("FALLA " + nombre + " | " + texto_reemplazar(d, "\n", "\\n"))
+    }
+}
+
+funcion probar(nombre, f) {
+    intentar { f() } capturar (e) { revisar(nombre, falso, "lanzó un error inesperado: " + e) }
+}
+
+// ── Propiedades ─────────────────────────────────────────────────────────────
+
+funcion caso() {
+    sea a = entero_azar()
+    sea b = entero_azar()
+    sea c = entero_azar()
+
+    probar("suma-resta", funcion() { revisar("suma-resta", (a + b) - b == a, "a=" + a + " b=" + b + " (a+b)-b=" + ((a + b) - b)) })
+    probar("suma-conmutativa", funcion() { revisar("suma-conmutativa", a + b == b + a, "a=" + a + " b=" + b) })
+    probar("producto-conmutativo", funcion() { revisar("producto-conmutativo", a * b == b * a, "a=" + a + " b=" + b + " a*b=" + (a * b) + " b*a=" + (b * a)) })
+    probar("distributiva", funcion() { revisar("distributiva", a * (b + c) == a * b + a * c, "a=" + a + " b=" + b + " c=" + c) })
+    probar("asociativa", funcion() { revisar("asociativa", (a + b) + c == a + (b + c), "a=" + a + " b=" + b + " c=" + c) })
+    probar("cero-uno", funcion() { revisar("cero-uno", a * 1 == a y a + 0 == a y a * 0 == 0 y a - a == 0, "a=" + a) })
+    probar("texto-numero", funcion() {
+        sea t = a_texto(a)
+        revisar("texto-numero", a_numero(t) == a, "a=" + a + " texto=" + t + " vuelta=" + a_numero(t))
+    })
+    probar("potencia", funcion() {
+        sea k = azar(12)
+        sea x = azar(41) - 20
+        sea p = 1
+        sea i = 0
+        mientras (i < k) { p = p * x i += 1 }
+        revisar("potencia", potencia(x, k) == p, "potencia(" + x + ", " + k + ")=" + potencia(x, k) + " esperado " + p)
+    })
+    probar("modulo", funcion() {
+        sea d = azar(1000) + 1
+        sea x = azar(2000000) - 1000000
+        sea r = x % d
+        revisar("modulo-rango", r > 0 - d y r < d, "x=" + x + " d=" + d + " r=" + r)
+        revisar("modulo-reconstruye", ((x - r) % d) == 0, "x=" + x + " d=" + d + " r=" + r)
+    })
+
+    probar("ordenar", funcion() {
+        sea l = []
+        sea suma = 0
+        sea i = 0
+        mientras (i < azar(60)) {
+            sea v = azar(2000) - 1000
+            l.agregar(v)
+            suma = suma + v
+            i += 1
+        }
+        sea o = ordenar(l)
+        sea ok = longitud(o) == longitud(l)
+        sea s2 = 0
+        sea j = 0
+        mientras (j < longitud(o)) {
+            s2 = s2 + o[j]
+            si (j > 0 y o[j - 1] > o[j]) { ok = falso }
+            j += 1
+        }
+        revisar("ordenar", ok y s2 == suma, "entrada=" + l + " salida=" + o)
+    })
+
+    sea t = texto_azar()
+    probar("invertir-dos-veces", funcion() { revisar("invertir-dos-veces", texto_invertir(texto_invertir(t)) == t, "texto=" + t + " resultado=" + texto_invertir(texto_invertir(t))) })
+    probar("dividir-unir", funcion() { revisar("dividir-unir", texto_unir(texto_dividir(t, ","), ",") == t, "texto=" + t) })
+    probar("reemplazar-ida-vuelta", funcion() {
+        si (no texto_contiene(t, "#")) { revisar("reemplazar-ida-vuelta", texto_reemplazar(texto_reemplazar(t, "a", "#"), "#", "a") == t, "texto=" + t) }
+    })
+    probar("concatenar-longitud", funcion() {
+        sea u = texto_azar()
+        revisar("concatenar-longitud", longitud(t + u) == longitud(t) + longitud(u), "t=" + t + " u=" + u)
+    })
+    probar("subcadena-reconstruye", funcion() {
+        sea n = longitud(t)
+        sea p = 0
+        si (n > 0) { p = azar(n + 1) }
+        revisar("subcadena-reconstruye", texto_subcadena(t, 0, p) + texto_subcadena(t, p, n) == t, "texto=" + t + " p=" + p)
+    })
+
+    sea v = valor_json(0)
+    probar("json-ida-vuelta", funcion() {
+        sea j1 = json_texto(v)
+        sea j2 = json_texto(cfv_json_parsear(j1))
+        revisar("json-ida-vuelta", j1 == j2, "original=" + j1 + " vuelta=" + j2)
+    })
+
+    sea crudo = bytes_azar(azar(300))
+    probar("base64-ida-vuelta", funcion() { revisar("base64-ida-vuelta", base64_decodificar(base64_codificar(crudo)) == crudo, longitud(crudo) + " bytes") })
+    probar("url-ida-vuelta", funcion() { revisar("url-ida-vuelta", url_decodificar(url_codificar(t)) == t, "texto=" + t) })
+    probar("zlib-ida-vuelta", funcion() { revisar("zlib-ida-vuelta", zlib_descomprimir(zlib_comprimir(crudo, 1 + azar(9)), nulo) == crudo, longitud(crudo) + " bytes") })
+    probar("lz4-ida-vuelta", funcion() { revisar("lz4-ida-vuelta", lz4_decompress(lz4_compress(crudo)) == crudo, longitud(crudo) + " bytes") })
+    probar("snappy-ida-vuelta", funcion() { revisar("snappy-ida-vuelta", snappy_decompress(snappy_compress(crudo)) == crudo, longitud(crudo) + " bytes") })
+    probar("zstd-ida-vuelta", funcion() { revisar("zstd-ida-vuelta", zstd_decompress(zstd_compress(crudo)) == crudo, longitud(crudo) + " bytes") })
+
+    probar("mapa-claves", funcion() {
+        sea m = {}
+        sea n = azar(50)
+        sea i = 0
+        mientras (i < n) { m["c" + i] = i * 3 i += 1 }
+        sea ok = longitud(claves(m)) == n
+        i = 0
+        mientras (i < n) {
+            si (m["c" + i] != i * 3) { ok = falso }
+            i += 1
+        }
+        revisar("mapa-claves", ok, n + " claves")
+    })
+}
+
+sea args = argumentos()
+sea semilla = 1
+sea casos = 200
+si (longitud(args) > 0) { semilla = a_numero(args[0]) }
+si (longitud(args) > 1) { casos = a_numero(args[1]) }
+sembrar(semilla)
+sea k = 0
+mientras (k < casos) {
+    caso()
+    k += 1
+}
+mostrar("FIN " + casos + " " + fallas)

@@ -1,0 +1,78 @@
+// objetivos/cforge/fugas.cfv — Fuzz Lab de Vemoris · detector de fugas.
+//
+// Repite una tarea N veces creando y descartando datos. Si C-Forge libera
+// bien la memoria, el pico de memoria es casi igual con N y con 4·N. Si
+// crece en proporción, hay una fuga. El Fuzz Lab mide la memoria desde fuera.
+//
+//   cforge fugas.cfv ESCENARIO N
+
+funcion escenario(nombre) {
+    si (nombre == "listas") {
+        sea l = []
+        sea i = 0
+        mientras (i < 1000) { l.agregar([i, i + 1]) i += 1 }
+        retornar longitud(l)
+    }
+    si (nombre == "textos") {
+        sea t = texto_repetir("x", 5000) + "ñ🔥"
+        retornar longitud(texto_reemplazar(t, "x", "yz"))
+    }
+    si (nombre == "mapas") {
+        sea m = {}
+        sea i = 0
+        mientras (i < 500) { m["k" + i] = {"v": i} i += 1 }
+        retornar longitud(claves(m))
+    }
+    si (nombre == "closures") {
+        sea fs = []
+        sea i = 0
+        mientras (i < 500) {
+            sea k = i
+            fs.agregar(funcion() { retornar k })
+            i += 1
+        }
+        retornar fs[10]()
+    }
+    si (nombre == "excepciones") {
+        sea n = 0
+        sea i = 0
+        mientras (i < 300) {
+            intentar { lanzar "error " + i } capturar (e) { n += longitud(e) }
+            i += 1
+        }
+        retornar n
+    }
+    si (nombre == "json") {
+        sea d = []
+        sea i = 0
+        mientras (i < 200) { d.agregar({"id": i, "x": [1, 2, 3]}) i += 1 }
+        retornar longitud(json_texto(cfv_json_parsear(json_texto(d))))
+    }
+    si (nombre == "objetos") {
+        sea r = nulo
+        sea i = 0
+        mientras (i < 1000) {
+            r = {"sig": r, "v": i}
+            i += 1
+        }
+        retornar r["v"]
+    }
+    si (nombre == "enteros") {
+        sea f = 1
+        sea i = 1
+        mientras (i <= 300) { f = f * i i += 1 }
+        retornar longitud(a_texto(f))
+    }
+    lanzar "escenario desconocido: " + nombre
+}
+
+sea args = argumentos()
+sea nombre = args[0]
+sea n = a_numero(args[1])
+sea k = 0
+sea total = 0
+mientras (k < n) {
+    total = total + escenario(nombre)
+    k += 1
+}
+mostrar("FIN " + nombre + " " + total)

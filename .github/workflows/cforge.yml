@@ -48,9 +48,18 @@ jobs:
       - name: Compilar C-Forge desde la semilla
         run: make -C cforge build
 
+      - name: Repo privado de reportes
+        env:
+          REPORTES_TOKEN: ${{ secrets.REPORTES_TOKEN }}
+        run: |
+          if [ -n "$REPORTES_TOKEN" ]; then
+            git clone -q "https://x-access-token:${REPORTES_TOKEN}@github.com/VemorisSoftware/FuzzLab-Reportes.git" privado
+          fi
+
       - name: Atacar (salida confidencial, no se muestra)
         env:
           CFORGE_DIR: cforge
+          BASE_RENDIMIENTO: privado/reportes/cforge/rendimiento-base.tsv
           MINUTOS: ${{ github.event.inputs.minutos || '330' }}
         run: |
           mkdir -p salida
@@ -58,17 +67,16 @@ jobs:
           echo "Corrida terminada. El reporte es confidencial y se envía al repo privado."
 
       - name: Enviar reporte al repo privado
-        env:
-          REPORTES_TOKEN: ${{ secrets.REPORTES_TOKEN }}
         run: |
-          if [ -z "$REPORTES_TOKEN" ]; then
+          if [ ! -d privado ]; then
             echo "Falta el secreto REPORTES_TOKEN: el reporte se descarta para no exponerlo."
             exit 0
           fi
           carpeta="reportes/cforge/$(date -u +%Y-%m-%d_%H%M)_corrida-${{ github.run_number }}"
-          git clone -q "https://x-access-token:${REPORTES_TOKEN}@github.com/VemorisSoftware/FuzzLab-Reportes.git" privado
           mkdir -p "privado/$carpeta"
           cp -r salida/. "privado/$carpeta/"
+          # Los tiempos de esta corrida son la referencia para la próxima.
+          [ -s salida/rendimiento.tsv ] && cp salida/rendimiento.tsv privado/reportes/cforge/rendimiento-base.tsv
           cd privado
           git config user.name "Vemoris Software"
           git config user.email "software@vemoris.cl"
@@ -82,7 +90,7 @@ jobs:
               echo "---"
               echo "Reproductores: carpeta \`$carpeta\` de este repo."
             } > ../cuerpo.md
-            export GH_TOKEN="$REPORTES_TOKEN"
+            export GH_TOKEN="${{ secrets.REPORTES_TOKEN }}"
             R=VemorisSoftware/FuzzLab-Reportes
             gh label create cforge --repo "$R" --color D93F0B --description "Fallas en C-Forge" --force > /dev/null
             numero=$(gh issue list --repo "$R" --label cforge --state open --json number --jq '.[0].number')
