@@ -1,0 +1,81 @@
+# Fuzz Lab de Vemoris · objetivo: C-Forge (VemorisSoftware/cforge).
+#
+# Corre en tandas de 5,5 horas, una cada 6 horas: en la práctica no para.
+# Para PARARLO: Settings → Secrets and variables → Actions → Variables →
+# crea FUZZ_LAB_ACTIVO con el valor "no". Para reanudarlo, bórrala.
+#
+# Si encuentra fallas, abre (o actualiza) un issue con la etiqueta cforge.
+# Los reproductores quedan como artefacto de cada corrida.
+
+name: Atacar C-Forge
+
+on:
+  schedule:
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      minutos:
+        description: "Minutos de ataque (máximo 330)"
+        required: false
+        default: "330"
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: fuzz-cforge
+  cancel-in-progress: false
+
+jobs:
+  atacar:
+    if: vars.FUZZ_LAB_ACTIVO != 'no'
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Fuzz Lab
+        uses: actions/checkout@v4
+
+      - name: C-Forge (última versión de main)
+        uses: actions/checkout@v4
+        with:
+          repository: VemorisSoftware/cforge
+          path: cforge
+
+      - name: Compilar C-Forge desde la semilla
+        run: make -C cforge build
+
+      - name: Atacar
+        id: lab
+        continue-on-error: true
+        env:
+          CFORGE_DIR: cforge
+          MINUTOS: ${{ github.event.inputs.minutos || '330' }}
+        run: sh objetivos/cforge/fuzzlab.sh "$MINUTOS" salida
+
+      - name: Guardar reporte y reproductores
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cforge-${{ github.run_number }}
+          path: salida
+          retention-days: 30
+
+      - name: Publicar reporte en un issue
+        if: steps.lab.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh label create cforge --color D93F0B --description "Fallas encontradas en C-Forge" --force
+          {
+            head -c 60000 salida/REPORTE.md
+            echo
+            echo "---"
+            echo "Reproductores: artefacto **cforge-${{ github.run_number }}** en ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          } > cuerpo.md
+          numero=$(gh issue list --label cforge --state open --json number --jq '.[0].number')
+          if [ -n "$numero" ]; then
+            gh issue comment "$numero" --body-file cuerpo.md
+          else
+            gh issue create --title "🔬 C-Forge: fallas encontradas" --label cforge --body-file cuerpo.md
+          fi
