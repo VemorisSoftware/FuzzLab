@@ -1,0 +1,57 @@
+// objetivos/cforge/generador.cfv — Fuzz Lab de Vemoris.
+//
+// Escribe en la salida un programa C-Forge de estrés, armado al azar con
+// piezas que empujan al runtime al límite: recursión profunda, enteros
+// gigantes, textos y listas enormes, estructuras anidadas, closures,
+// excepciones en bucles y conversiones extremas. El programa puede terminar
+// con un error de C-Forge (eso está bien), pero nunca con una señal del
+// sistema (segfault, abort) ni colgarse sin fin.
+//
+//   cforge generador.cfv SEMILLA > caso.cfv
+
+sea _estado = 1
+funcion sembrar(s) { _estado = (s % 2147483647) + 1 }
+funcion azar(n) {
+    _estado = (_estado * 48271) % 2147483647
+    si (n <= 0) { retornar 0 }
+    retornar _estado % n
+}
+funcion elegir(l) { retornar l[azar(longitud(l))] }
+funcion tam() { retornar elegir([0, 1, 7, 100, 1000, 10000, 100000, 1000000]) }
+
+funcion pieza(i) {
+    sea n = tam()
+    sea tipo = azar(20)
+    si (tipo == 0) { retornar "funcion rec" + i + "(n) { si (n <= 0) { retornar 0 } retornar 1 + rec" + i + "(n - 1) }\nmostrar(rec" + i + "(" + n + "))" }
+    si (tipo == 1) { retornar "sea f" + i + " = 1\npara k en rango(1, " + (n % 3000) + ") { f" + i + " = f" + i + " * k }\nmostrar(longitud(a_texto(f" + i + ")))" }
+    si (tipo == 2) { retornar "sea t" + i + " = texto_repetir(\"ñ🔥\", " + n + ")\nmostrar(longitud(texto_invertir(t" + i + ")))" }
+    si (tipo == 3) { retornar "sea l" + i + " = []\npara k en rango(0, " + n + ") { l" + i + ".agregar(k * 3 % 7) }\nmostrar(longitud(ordenar(l" + i + ")))" }
+    si (tipo == 4) { retornar "sea m" + i + " = {}\npara k en rango(0, " + n + ") { m" + i + "[\"k\" + k] = k }\nmostrar(longitud(claves(m" + i + ")))" }
+    si (tipo == 5) { retornar "sea a" + i + " = []\nsea c" + i + " = a" + i + "\npara k en rango(0, " + (n % 20000) + ") { sea x = [] c" + i + ".agregar(x) c" + i + " = x }\nmostrar(longitud(json_texto(a" + i + ")))" }
+    si (tipo == 6) { retornar "intentar { mostrar(" + elegir(["1 / 0", "10 % 0", "[1, 2][99]", "{}[\"x\"].y", "nulo.algo", "a_numero(\"zz\")", "texto_subcadena(\"abc\", 5, 2)", "lanzar \"boom\""]) + ") } capturar (e) { mostrar(\"error: \" + e) }" }
+    si (tipo == 7) { retornar "sea s" + i + " = 0\npara k en rango(0, " + (n % 100000) + ") { intentar { si (k % 3 == 0) { lanzar k } s" + i + " = s" + i + " + 1 } capturar (e) { s" + i + " = s" + i + " - 1 } }\nmostrar(s" + i + ")" }
+    si (tipo == 8) { retornar "funcion hacer" + i + "(n) { si (n == 0) { retornar funcion() { retornar 1 } } sea g = hacer" + i + "(n - 1) retornar funcion() { retornar g() + 1 } }\nmostrar(hacer" + i + "(" + (n % 50000) + ")())" }
+    si (tipo == 9) { retornar "mostrar(longitud(a_texto(potencia(" + elegir(["2", "-3", "99999999999999999999"]) + ", " + elegir(["0", "1", "64", "1000", "100000", "-1"]) + ") * " + elegir(["99999999999999999999999999999999", "-1", "0"]) + ")))" }
+    si (tipo == 10) { retornar "mostrar(a_numero(\"" + texto_repetir("9", n % 20000) + "\") + 1)" }
+    si (tipo == 11) { retornar "clase Nodo" + i + " { sea sig sea v funcion constructor(v) { esto.v = v esto.sig = nulo } }\nsea r" + i + " = Nodo" + i + "(0)\nsea q" + i + " = r" + i + "\npara k en rango(0, " + (n % 200000) + ") { q" + i + ".sig = Nodo" + i + "(k) q" + i + " = q" + i + ".sig }\nmostrar(q" + i + ".v)" }
+    si (tipo == 12) { retornar "mostrar(longitud(texto_dividir(texto_repetir(\"a,\", " + n + "), \",\")))" }
+    si (tipo == 13) { retornar "mostrar(json_texto(cfv_json_parsear(\"" + texto_repetir("[", n % 5000) + texto_repetir("]", n % 5000) + "\")) != nulo)" }
+    si (tipo == 14) { retornar "sea z" + i + " = \"\"\npara k en rango(0, " + (n % 50000) + ") { z" + i + " = z" + i + " + caracter(k % 1114111) }\nmostrar(longitud(z" + i + "))" }
+    si (tipo == 15) { retornar "mostrar(" + elegir(["9223372036854775807 + 1", "-9223372036854775808 - 1", "0.1 + 0.2", "1 / 3", "(-8) ** 0.5", "1e308 * 10", "-0.0", "7 % -3"]) + ")" }
+    si (tipo == 16) { retornar "sea e" + i + " = []\npara k en rango(0, " + (n % 300) + ") { e" + i + " = [e" + i + "] }\nmostrar(a_texto(e" + i + ") != \"\")" }
+    si (tipo == 17) { retornar "mostrar(texto_reemplazar(texto_repetir(\"ab\", " + (n % 100000) + "), \"\", \"x\") != nulo)" }
+    si (tipo == 18) { retornar "sea w" + i + " = 0\nmientras (w" + i + " < " + (n % 2000000) + ") { w" + i + " += 1 }\nmostrar(w" + i + ")" }
+    retornar "mostrar(longitud(ordenar([" + elegir(["3, 1, 2", "\"b\", \"a\"", "1, \"a\", nulo, [1], {}", "nulo, nulo", ""]) + "])))"
+}
+
+sea args = argumentos()
+sea semilla = 1
+si (longitud(args) > 0) { semilla = a_numero(args[0]) }
+sembrar(semilla)
+mostrar("// Fuzz Lab · programa de estrés · semilla " + semilla)
+sea piezas = 1 + azar(6)
+sea i = 0
+mientras (i < piezas) {
+    mostrar(pieza(i))
+    i += 1
+}

@@ -1,0 +1,197 @@
+// objetivos/cforge/ataques_stdlib.cfv — Fuzz Lab de Vemoris.
+//
+// Ataca los analizadores y descompresores de la biblioteca estándar con
+// entradas aleatorias, mutadas y hostiles. Cada función atacada puede
+// lanzar un error (eso está bien), pero NUNCA debe cerrar el proceso,
+// colgarse ni dejar escapar un error que intentar/capturar no atrapa.
+//
+//   ataques SEMILLA CASOS                  ronda completa
+//   ataques SEMILLA CASOS DESDE            sigue desde el caso DESDE
+//   ataques SEMILLA CASOS 0 CASO RUTA      guarda la entrada del caso CASO en
+//                                          RUTA y lo repite (reproductor)
+//
+// Antes de cada ataque escribe "caso N objetivo" en la salida: si el proceso
+// muere, la última línea dice qué caso lo mató. Al final escribe "FIN".
+
+importar "base64"
+importar "json"
+importar "csv"
+importar "regex"
+importar "xml"
+importar "markdown"
+importar "compress"
+importar "imagen"
+
+// ── Azar reproducible (LCG de 31 bits) ──────────────────────────────────────
+
+sea _estado = 1
+
+funcion sembrar(s) { _estado = (s % 2147483647) + 1 }
+
+funcion azar(n) {
+    _estado = (_estado * 48271) % 2147483647
+    si (n <= 0) { retornar 0 }
+    retornar _estado % n
+}
+
+funcion elegir(lista) { retornar lista[azar(longitud(lista))] }
+
+// ── Entradas hostiles ───────────────────────────────────────────────────────
+
+funcion bytes_azar(n) {
+    sea r = ""
+    sea i = 0
+    mientras (i < n) {
+        r = r + char_de(azar(256))
+        i += 1
+    }
+    retornar r
+}
+
+// Inserta, borra, repite o corrompe trozos de un texto válido.
+funcion mutar(t, veces) {
+    sea r = t
+    sea k = 0
+    mientras (k < veces) {
+        sea n = longitud(r)
+        sea p = 0
+        si (n > 0) { p = azar(n) }
+        sea tipo = azar(7)
+        si (tipo == 0 y n > 0) { r = texto_subcadena(r, 0, p) + texto_subcadena(r, p + 1, n) }
+        sino si (tipo == 1) { r = texto_subcadena(r, 0, p) + char_de(azar(256)) + texto_subcadena(r, p, n) }
+        sino si (tipo == 2 y n > 0) { r = texto_subcadena(r, 0, p) + texto_repetir(texto_subcadena(r, p, p + 1), 1 + azar(50)) + texto_subcadena(r, p + 1, n) }
+        sino si (tipo == 3) { r = texto_subcadena(r, 0, p) + elegir(TROZOS) + texto_subcadena(r, p, n) }
+        sino si (tipo == 4 y n > 1) { r = texto_subcadena(r, 0, p) }
+        sino si (tipo == 5) { r = r + r }
+        sino { r = texto_subcadena(r, 0, p) + "99999999999999999999999999999999" + texto_subcadena(r, p, n) }
+        k += 1
+    }
+    retornar r
+}
+
+sea TROZOS = ["{", "}", "[", "]", "\"", "\\", "\\u", "\\uD800", "<", ">", "</", "<!--", "]]>", "&", "&#", "&#x110000;",
+    ",", ":", "\n", "\r\n", char_de(0), char_de(255), char_de(192), char_de(237) + char_de(160) + char_de(128),
+    "1e999999", "-0", "NaN", "Infinity", "0x", "=", "%", "%zz", "%00", "**", "__", "`", "```", "#", "|", "(", ")", "*", "+", "?", "{999999}", "(?:", "\\1", "[^", "$"]
+
+funcion anidado(abre, cierra, n) { retornar texto_repetir(abre, n) + texto_repetir(cierra, n) }
+
+// Entrada para un objetivo: azar puro, válida mutada o patológica.
+funcion entrada(semillas, patologicas) {
+    sea modo = azar(10)
+    si (modo < 2) { retornar bytes_azar(azar(300)) }
+    si (modo < 4) { retornar elegir(patologicas) }
+    retornar mutar(elegir(semillas), 1 + azar(6))
+}
+
+// ── Objetivos ───────────────────────────────────────────────────────────────
+
+sea JSON_OK = ["{\"a\": [1, 2.5, -3e10, true, false, null], \"b\": {\"c\": \"ñ\\u00e1\\n\"}}", "[]", "\"x\"", "123456789012345678901234567890", "[[[[1]]]]"]
+sea JSON_MAL = [anidado("[", "]", 100000), anidado("{\"a\":", "}", 50000), "\"" + texto_repetir("\\u0000", 20000) + "\"", "1" + texto_repetir("0", 100000), "[" + texto_repetir("1,", 200000) + "1]", "\"\\uD800\\uDC00\\uDFFF\"", "-", "1e", "[1,]", "{\"a\"}"]
+
+sea B64_OK = ["aG9sYSBtdW5kbw==", "", "AA==", "////", "YQ"]
+sea B64_MAL = ["====", "a===", texto_repetir("A", 300001), "ññ==", "aGVsbG8=\n\n\nd29ybGQ="]
+
+sea CSV_OK = ["a,b,c\n1,2,3\n", "\"x\"\"y\",z\r\n", "nombre;edad\nana;3", ",,,\n,,,"]
+sea CSV_MAL = ["\"" + texto_repetir("a", 100000), texto_repetir(",", 200000), texto_repetir("\"\"", 50000), "\"a\nb\nc"]
+
+sea REGEX_PATRONES = ["(a+)+$", "(a|a)*$", "(a|aa)+$", "^(\\w+\\s?)*$", "(.*a){20}", "[a-z]+@[a-z]+\\.[a-z]+", "\\d{3}-\\d{4}", "(", ")", "[", "a{999999}", "\\", "(?<n>x)\\k<n>", "*", "a**", "[z-a]", "(a)\\9"]
+sea REGEX_TEXTOS = [texto_repetir("a", 40) + "!", "usuario@correo.cl", texto_repetir("aaaa ", 30) + "!", "", "123-4567"]
+
+sea XML_OK = ["<a x=\"1\"><b>texto &amp; más</b><c/></a>", "<?xml version=\"1.0\"?><r/>", "<a><![CDATA[<<>>]]></a>"]
+sea XML_MAL = [anidado("<a>", "</a>", 50000), "<a " + texto_repetir("x=\"1\" ", 50000) + "/>", "<!DOCTYPE a [<!ENTITY x \"&x;&x;\">]><a>&x;</a>", "<a>&#99999999;</a>", "<a></b>", "<", "<<<<>>>>"]
+
+sea MD_OK = ["# Título\n\n**negrita** y `código`\n\n- uno\n- dos\n\n[enlace](http://x.cl)", "```\ncódigo\n```", "> cita\n>> doble"]
+sea MD_MAL = [texto_repetir(">", 100000) + " x", texto_repetir("*", 100000), texto_repetir("[", 50000) + texto_repetir("](", 50000), texto_repetir("- ", 50000) + "x", "<script>alert(1)</script>", "[x](javascript:alert(1))"]
+
+sea NUM_MAL = ["1" + texto_repetir("0", 100000), "-" + texto_repetir("9", 50000), "1e" + texto_repetir("9", 1000), "0x" + texto_repetir("f", 1000), "  12  ", "١٢٣", "NaN", "--1", "1.2.3", ""]
+
+// Compresores: comprimir algo y luego corromperlo.
+funcion comprimido(tipo) {
+    sea plano = elegir(["", "a", texto_repetir("abc", 1000), bytes_azar(200), texto_repetir(char_de(0), 5000)])
+    sea c = ""
+    si (tipo == "lz4") { c = lz4_compress(plano) }
+    sino si (tipo == "snappy") { c = snappy_compress(plano) }
+    sino si (tipo == "zstd") { c = zstd_compress(plano) }
+    sino { c = zlib_comprimir(plano, 6) }
+    si (azar(4) == 0) { retornar c }
+    retornar mutar(c, 1 + azar(4))
+}
+
+sea OBJETIVOS = ["json", "base64", "url", "csv", "regex", "xml", "markdown", "numero", "lz4", "snappy", "zstd", "zlib", "png", "texto"]
+
+// Prepara la entrada (texto) y la función que la ataca.
+funcion preparar(objetivo) {
+    si (objetivo == "json") { retornar {"e": entrada(JSON_OK, JSON_MAL), "f": funcion(x) { retornar json_parsear(x) }} }
+    si (objetivo == "base64") { retornar {"e": entrada(B64_OK, B64_MAL), "f": funcion(x) { retornar base64_decodificar(x) }} }
+    si (objetivo == "url") { retornar {"e": entrada(["a%20b", "%C3%B1", "x+y"], ["%", "%%%", "%F0%9F", texto_repetir("%FF", 50000), "%E0%80%80"]), "f": funcion(x) { retornar url_decodificar(x) }} }
+    si (objetivo == "csv") { retornar {"e": entrada(CSV_OK, CSV_MAL), "f": funcion(x) { retornar csv_leer(x) }} }
+    si (objetivo == "regex") {
+        sea p = entrada(REGEX_PATRONES, REGEX_PATRONES)
+        sea t = elegir(REGEX_TEXTOS)
+        retornar {"e": p + char_de(1) + t, "f": funcion(x) {
+            sea partes = texto_dividir(x, char_de(1))
+            retornar regex_buscar_todos(partes[0], partes[longitud(partes) - 1])
+        }}
+    }
+    si (objetivo == "xml") { retornar {"e": entrada(XML_OK, XML_MAL), "f": funcion(x) { retornar xml_analizar(x) }} }
+    si (objetivo == "markdown") { retornar {"e": entrada(MD_OK, MD_MAL), "f": funcion(x) { retornar markdown_html(x) }} }
+    si (objetivo == "numero") { retornar {"e": entrada(["42", "-3.5", "1e10"], NUM_MAL), "f": funcion(x) { retornar a_numero(x) }} }
+    si (objetivo == "lz4") { retornar {"e": comprimido("lz4"), "f": funcion(x) { retornar lz4_decompress(x) }} }
+    si (objetivo == "snappy") { retornar {"e": comprimido("snappy"), "f": funcion(x) { retornar snappy_decompress(x) }} }
+    si (objetivo == "zstd") { retornar {"e": comprimido("zstd"), "f": funcion(x) { retornar zstd_decompress(x) }} }
+    si (objetivo == "zlib") { retornar {"e": comprimido("zlib"), "f": funcion(x) { retornar zlib_descomprimir(x) }} }
+    si (objetivo == "png") { retornar {"e": mutar(png_minimo(), 1 + azar(5)), "f": funcion(x) { retornar png_decodificar(x) }} }
+    // texto: operaciones de cadenas con UTF-8 roto e índices extremos
+    retornar {"e": entrada(["hola ñandú 🔥", "a,b,,c"], [bytes_azar(64), char_de(255) + char_de(254), texto_repetir("🔥", 20000)]), "f": funcion(x) {
+        texto_dividir(x, ",")
+        texto_reemplazar(x, "a", texto_repetir("b", 3))
+        texto_mayusculas(x)
+        texto_recortar(x)
+        texto_subcadena(x, longitud(x) / 3, longitud(x) * 2)
+        retornar texto_invertir(x)
+    }}
+}
+
+funcion be32(n) { retornar bytes_entero(n, 4, 0) }
+funcion bloque_png(tipo, datos) { retornar be32(longitud(datos)) + tipo + datos + be32(crc32(tipo + datos)) }
+funcion png_minimo() {
+    sea firma = char_de(137) + "PNG" + char_de(13) + char_de(10) + char_de(26) + char_de(10)
+    sea ihdr = be32(1 + azar(4)) + be32(1 + azar(4)) + char_de(8) + char_de(elegir([0, 2, 3, 4, 6])) + char_de(0) + char_de(0) + char_de(0)
+    retornar firma + bloque_png("IHDR", ihdr) + bloque_png("IDAT", zlib_comprimir(bytes_azar(80), 6)) + bloque_png("IEND", "")
+}
+
+// ── Ronda ───────────────────────────────────────────────────────────────────
+//   args: SEMILLA CASOS [DESDE] [SOLO RUTA]
+//   DESDE: salta (sin ejecutar) los casos anteriores; sirve para seguir
+//   después de un caso que colgó el proceso.
+
+sea args = argumentos()
+sea semilla = 1
+sea casos = 200
+sea desde = 0
+sea solo = -1
+sea ruta_solo = ""
+si (longitud(args) > 0) { semilla = a_numero(args[0]) }
+si (longitud(args) > 1) { casos = a_numero(args[1]) }
+si (longitud(args) > 2) { desde = a_numero(args[2]) }
+si (longitud(args) > 4) {
+    solo = a_numero(args[3])
+    ruta_solo = args[4]
+}
+
+sembrar(semilla)
+sea errores_limpios = 0
+sea i = 0
+mientras (i < casos) {
+    sea objetivo = OBJETIVOS[azar(longitud(OBJETIVOS))]
+    sea p = preparar(objetivo)
+    si (i >= desde y (solo < 0 o i == solo)) {
+        mostrar("caso " + i + " " + objetivo)
+        si (i == solo) { escribir_archivo(ruta_solo, p["e"]) }
+        intentar {
+            p["f"](p["e"])
+        } capturar (e) { errores_limpios += 1 }
+    }
+    i += 1
+}
+mostrar("FIN " + casos + " casos, " + errores_limpios + " errores capturados")

@@ -24,8 +24,7 @@ Una **falla** es un cierre por señal (segfault, abort, sin memoria), un cuelgue
 ## Cómo funciona
 
 - Corre cada 6 horas, en tandas de 5,5 horas, sobre la última versión de `main` de C-Forge.
-- Si encuentra fallas, abre o actualiza un **issue** con el reporte (etiqueta `cforge`).
-- Los reproductores quedan en el artefacto de cada corrida, en **Actions**.
+- 🔒 **Confidencial:** las vulnerabilidades encontradas nunca se publican. El reporte y los reproductores van solo a un repo privado de Vemoris Software.
 
 **Para pararlo:** Settings → Secrets and variables → Actions → Variables → `FUZZ_LAB_ACTIVO` = `no`.
 

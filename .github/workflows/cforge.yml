@@ -1,11 +1,15 @@
 # Fuzz Lab de Vemoris · objetivo: C-Forge (VemorisSoftware/cforge).
 #
 # Corre en tandas de 5,5 horas, una cada 6 horas: en la práctica no para.
+#
+# 🔒 CONFIDENCIAL: las vulnerabilidades encontradas NUNCA se publican aquí.
+# Este repo es público, así que la corrida no muestra hallazgos en el log,
+# no sube artefactos y no abre issues públicos. El reporte y los
+# reproductores se envían solo al repo PRIVADO VemorisSoftware/FuzzLab-Reportes
+# usando el secreto REPORTES_TOKEN.
+#
 # Para PARARLO: Settings → Secrets and variables → Actions → Variables →
 # crea FUZZ_LAB_ACTIVO con el valor "no". Para reanudarlo, bórrala.
-#
-# Si encuentra fallas, abre (o actualiza) un issue con la etiqueta cforge.
-# Los reproductores quedan como artefacto de cada corrida.
 
 name: Atacar C-Forge
 
@@ -21,7 +25,6 @@ on:
 
 permissions:
   contents: read
-  issues: write
 
 concurrency:
   group: fuzz-cforge
@@ -45,37 +48,48 @@ jobs:
       - name: Compilar C-Forge desde la semilla
         run: make -C cforge build
 
-      - name: Atacar
-        id: lab
-        continue-on-error: true
+      - name: Atacar (salida confidencial, no se muestra)
         env:
           CFORGE_DIR: cforge
           MINUTOS: ${{ github.event.inputs.minutos || '330' }}
-        run: sh objetivos/cforge/fuzzlab.sh "$MINUTOS" salida
-
-      - name: Guardar reporte y reproductores
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: cforge-${{ github.run_number }}
-          path: salida
-          retention-days: 30
-
-      - name: Publicar reporte en un issue
-        if: steps.lab.outcome == 'failure'
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
-          gh label create cforge --color D93F0B --description "Fallas encontradas en C-Forge" --force
-          {
-            head -c 60000 salida/REPORTE.md
-            echo
-            echo "---"
-            echo "Reproductores: artefacto **cforge-${{ github.run_number }}** en ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          } > cuerpo.md
-          numero=$(gh issue list --label cforge --state open --json number --jq '.[0].number')
-          if [ -n "$numero" ]; then
-            gh issue comment "$numero" --body-file cuerpo.md
-          else
-            gh issue create --title "🔬 C-Forge: fallas encontradas" --label cforge --body-file cuerpo.md
+          mkdir -p salida
+          sh objetivos/cforge/fuzzlab.sh "$MINUTOS" salida > salida/consola.txt 2>&1 || true
+          echo "Corrida terminada. El reporte es confidencial y se envía al repo privado."
+
+      - name: Enviar reporte al repo privado
+        env:
+          REPORTES_TOKEN: ${{ secrets.REPORTES_TOKEN }}
+        run: |
+          if [ -z "$REPORTES_TOKEN" ]; then
+            echo "Falta el secreto REPORTES_TOKEN: el reporte se descarta para no exponerlo."
+            exit 0
           fi
+          carpeta="reportes/cforge/$(date -u +%Y-%m-%d_%H%M)_corrida-${{ github.run_number }}"
+          git clone -q "https://x-access-token:${REPORTES_TOKEN}@github.com/VemorisSoftware/FuzzLab-Reportes.git" privado
+          mkdir -p "privado/$carpeta"
+          cp -r salida/. "privado/$carpeta/"
+          cd privado
+          git config user.name "Vemoris Software"
+          git config user.email "software@vemoris.cl"
+          git add -A
+          git commit -q -m "Reporte Fuzz Lab · C-Forge · corrida ${{ github.run_number }}"
+          git push -q
+          if [ -s "$carpeta/fallas.tsv" ]; then
+            {
+              head -c 60000 "$carpeta/REPORTE.md"
+              echo
+              echo "---"
+              echo "Reproductores: carpeta \`$carpeta\` de este repo."
+            } > ../cuerpo.md
+            export GH_TOKEN="$REPORTES_TOKEN"
+            R=VemorisSoftware/FuzzLab-Reportes
+            gh label create cforge --repo "$R" --color D93F0B --description "Fallas en C-Forge" --force > /dev/null
+            numero=$(gh issue list --repo "$R" --label cforge --state open --json number --jq '.[0].number')
+            if [ -n "$numero" ]; then
+              gh issue comment "$numero" --repo "$R" --body-file ../cuerpo.md > /dev/null
+            else
+              gh issue create --repo "$R" --title "🔬 C-Forge: fallas encontradas" --label cforge --body-file ../cuerpo.md > /dev/null
+            fi
+          fi
+          echo "Reporte enviado al repo privado."
