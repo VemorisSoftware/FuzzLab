@@ -28,7 +28,9 @@ Laboratorio de ataques automáticos de Vemoris. Bombardea nuestros proyectos con
 | **cruzadas** | Resultados incorrectos: propiedades que siempre deben cumplirse |
 | **rendimiento** | Velocidad contra la corrida anterior y contra C, C++, Rust, Java, C#, JavaScript y TypeScript |
 | **memoria** | Fugas: repite tareas 1000 y 4000 veces y vigila que la memoria no crezca sin control |
-| **regresiones** | Vuelve a probar todas las fallas de corridas anteriores y marca ✅ arreglada o 🔴 sigue |
+| **regresiones** | Vuelve a probar todas las fallas de corridas anteriores y marca ✅ arreglada, 🔴 sigue o 🚨 volvió a fallar |
+| **bisección** | Para cada falla nueva, encuentra el commit exacto de C-Forge que la introdujo (`biseccion.sh`, segundos por falla) |
+| **pruebas de regresión** | Cada falla arreglada pasa a ser una prueba de regresión mediante un PR automático al repo privado; se repasan en cada corrida |
 
 ### Fuzz Lab 2.0
 

@@ -24,6 +24,7 @@
 # Variables opcionales:
 #   BASE_RENDIMIENTO  tiempos de la corrida anterior
 #   PREVIOS           carpeta con los reportes anteriores (para regresiones)
+#   PRUEBAS_REGRESION carpeta con pruebas de regresión (fallas ya arregladas)
 #   PARALELO          trabajadores en paralelo (por defecto: núcleos, máx. 4)
 #
 # Una falla es: cierre por señal (segfault, abort, sin memoria), un programa
@@ -212,17 +213,19 @@ for escenario in listas textos mapas closures excepciones json objetos enteros; 
 done
 
 # ── Regresiones: ¿siguen fallando las fallas de corridas anteriores? ────
-: > "$SALIDA/regresiones.tsv"      # estado \t firma \t motor \t tipo \t corrida
+: > "$SALIDA/regresiones.tsv"      # estado \t firma \t motor \t tipo \t corrida \t archivo
 # Corre en paralelo con los trabajadores, máximo 45 minutos y 30 s por falla.
 regresiones() {
-    [ -n "${PREVIOS:-}" ] && [ -d "$PREVIOS" ] || return 0
     tope_reg=$(( $(date +%s) + 2700 ))
     mkdir -p "$T/reg"
+    : > "$T/reg/lista.tsv"
+    [ -n "${PREVIOS:-}" ] && [ -d "$PREVIOS" ] && {
     # La versión más reciente de cada firma (últimas 20 corridas).
     for d in $(ls -d "$PREVIOS"/*/ 2>/dev/null | sort | tail -20); do
         [ -s "$d/fallas.tsv" ] || continue
         awk -F '\t' -v c="$(basename "$d")" -v d="$d" 'NF >= 5 && $5 != "" {print $1 "\t" $2 "\t" $3 "\t" d $5 "\t" c}' "$d/fallas.tsv"
     done | awk -F '\t' '{u[$1] = $0} END {for (f in u) print u[f]}' | sort > "$T/reg/lista.tsv"
+    }
     while IFS="$(printf '\t')" read -r firma motor tipo archivo corrida; do
         quedan || break
         [ "$(date +%s)" -lt "$tope_reg" ] || break
@@ -242,8 +245,22 @@ regresiones() {
             *) continue ;;
         esac
         if [ -n "$clave" ]; then estado=sigue; else estado=arreglada; fi
-        printf '%s\t%s\t%s\t%s\t%s\n' "$estado" "$firma" "$motor" "$tipo" "$corrida" >> "$SALIDA/regresiones.tsv"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$estado" "$firma" "$motor" "$tipo" "$corrida" "$archivo" >> "$SALIDA/regresiones.tsv"
     done < "$T/reg/lista.tsv"
+    # Pruebas de regresión guardadas (fallas ya arregladas): si alguna vuelve
+    # a fallar, la falla regresó.
+    if [ -n "${PRUEBAS_REGRESION:-}" ] && [ -d "$PRUEBAS_REGRESION" ]; then
+        for f in "$PRUEBAS_REGRESION"/*.cfv; do
+            [ -f "$f" ] || continue
+            [ "$(date +%s)" -lt "$tope_reg" ] || break
+            cp "$f" "$T/reg/p.cfv"
+            clave=$(reproduce "$T/reg/p.cfv" run 30)
+            [ -z "$clave" ] && clave=$(reproduce "$T/reg/p.cfv" check 30)
+            if [ -n "$clave" ]; then
+                printf '%s\t%s\t%s\t%s\t%s\t%s\n' "volvio" "regresion|$(basename "$f")" "prueba de regresión" "$(nombre_clave "$clave")" "$(basename "$f")" "$f" >> "$SALIDA/regresiones.tsv"
+            fi
+        done
+    fi
 }
 
 # ── Trabajador: ataca en bucle hasta que se acabe el tiempo ─────────────
@@ -441,7 +458,7 @@ unicas=$(cut -f1 "$SALIDA/fallas.tsv" | sort -u | wc -l)
     echo "- **Ataques:** $total_stdlib a la stdlib · $total_cruz pruebas cruzadas · $total_prog programas de estrés · $total_dif comparaciones normal/--release · $total_mut mutaciones · $total_fmt pruebas de formato · $total_bytes entradas de bytes"
     echo "- **Fallas únicas:** $unicas"
     if [ -s "$SALIDA/regresiones.tsv" ]; then
-        echo "- **Fallas anteriores:** $(grep -c '^arreglada' "$SALIDA/regresiones.tsv") ✅ arregladas · $(grep -c '^sigue' "$SALIDA/regresiones.tsv") 🔴 siguen"
+        echo "- **Fallas anteriores:** $(grep -c '^arreglada' "$SALIDA/regresiones.tsv") ✅ arregladas · $(grep -c '^sigue' "$SALIDA/regresiones.tsv") 🔴 siguen · $(grep -c '^volvio' "$SALIDA/regresiones.tsv") 🚨 volvieron"
     fi
     echo
     if [ "$unicas" -eq 0 ]; then
@@ -479,7 +496,7 @@ unicas=$(cut -f1 "$SALIDA/fallas.tsv" | sort -u | wc -l)
         echo "| Estado | Motor | Tipo | Cuántas | Vistas en |"
         echo "|---|---|---|---|---|"
         awk -F '\t' '{k = $1 "\t" $3 "\t" $4; n[k]++; c[k] = (k in c && index(c[k], $5)) ? c[k] : (c[k] ? c[k] ", " $5 : $5)} END {for (k in n) print k "\t" n[k] "\t" c[k]}' "$SALIDA/regresiones.tsv" | sort | while IFS="$(printf '\t')" read -r estado motor tipo cuantas corridas; do
-            if [ "$estado" = arreglada ]; then e="✅ arreglada"; else e="🔴 sigue"; fi
+            case "$estado" in arreglada) e="✅ arreglada" ;; volvio) e="🚨 volvió a fallar" ;; *) e="🔴 sigue" ;; esac
             echo "| $e | $motor | $tipo | $cuantas | $corridas |"
         done
     fi
@@ -523,6 +540,28 @@ unicas=$(cut -f1 "$SALIDA/fallas.tsv" | sort -u | wc -l)
     echo
     echo "Si la memoria con 4000 repeticiones es más del doble (y más de 50 MB) que con 1000, se marca como posible fuga."
 } > "$SALIDA/REPORTE.md"
+
+# ── Bisección: ¿en qué commit de C-Forge nació cada falla? ──────────────
+# Solo con historia de git disponible y para cierres (no cuelgues), máx. 6.
+if [ "$unicas" -gt 0 ] && [ "$(git -C "$RAIZ" rev-list --count HEAD 2>/dev/null || echo 0)" -gt 1 ]; then
+    : > "$T/bis.md"
+    awk -F '\t' '!v[$1]++ && $5 ~ /\.cfv$/ && $3 !~ /lento|cuelgue/ {print $2 "\t" $3 "\t" $5}' "$SALIDA/fallas.tsv" | head -6 |
+    while IFS="$(printf '\t')" read -r motor tipo archivo; do
+        modo=run; case "$tipo" in *compilador*) modo=check ;; esac
+        r=$(CFORGE_DIR="$RAIZ" sh "$LAB/biseccion.sh" "$SALIDA/$archivo" "$modo" 200 2>/dev/null | tail -1)
+        echo "| $motor | $tipo | \`$archivo\` | $r |" >> "$T/bis.md"
+    done
+    if [ -s "$T/bis.md" ]; then
+        {
+            echo
+            echo "## 🔎 ¿Qué commit introdujo cada falla?"
+            echo
+            echo "| Motor | Tipo | Reproductor | Resultado |"
+            echo "|---|---|---|---|"
+            cat "$T/bis.md"
+        } >> "$SALIDA/REPORTE.md"
+    fi
+fi
 
 echo
 echo "  Reporte: $SALIDA/REPORTE.md ($unicas fallas únicas en $DUR min)"

@@ -44,6 +44,7 @@ jobs:
         with:
           repository: VemorisSoftware/cforge
           path: cforge
+          fetch-depth: 300      # historia para la bisección
 
       - name: Compilar C-Forge desde la semilla
         run: make -C cforge build
@@ -61,6 +62,7 @@ jobs:
           CFORGE_DIR: cforge
           BASE_RENDIMIENTO: privado/reportes/cforge/rendimiento-base.tsv
           PREVIOS: privado/reportes/cforge
+          PRUEBAS_REGRESION: privado/pruebas-regresion/cforge
           MINUTOS: ${{ github.event.inputs.minutos || '330' }}
         run: |
           mkdir -p salida
@@ -102,3 +104,40 @@ jobs:
             fi
           fi
           echo "Reporte enviado al repo privado."
+
+      - name: PR con pruebas de regresión (fallas ya arregladas)
+        # Cada falla que vuelve a probarse y ya no falla se guarda como prueba
+        # de regresión, en un PR al repo PRIVADO: si la falla vuelve, se ve.
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.REPORTES_TOKEN }}
+        run: |
+          [ -d privado ] && [ -s salida/regresiones.tsv ] || exit 0
+          grep -q '^arreglada' salida/regresiones.tsv || exit 0
+          cd privado
+          git fetch -q origin
+          rama="regresiones/corrida-${{ github.run_number }}"
+          git checkout -q -b "$rama" origin/HEAD 2>/dev/null || git checkout -q -b "$rama"
+          mkdir -p pruebas-regresion/cforge
+          nuevas=0
+          while IFS="$(printf '\t')" read -r estado firma motor tipo corrida archivo; do
+            [ "$estado" = arreglada ] && [ -f "../$archivo" ] || continue
+            nombre="$(printf '%s' "$firma" | sha256sum | cut -c1-12)$(echo "$archivo" | sed -n 's/.*\(\.[a-z]*\)$/\1/p')"
+            [ -f "pruebas-regresion/cforge/$nombre" ] && continue
+            cp "../$archivo" "pruebas-regresion/cforge/$nombre"
+            printf '| `%s` | %s | %s | %s |\n' "$nombre" "$motor" "$tipo" "$corrida" >> ../tabla.md
+            nuevas=$((nuevas + 1))
+          done < ../salida/regresiones.tsv
+          [ "$nuevas" -gt 0 ] || exit 0
+          git add pruebas-regresion
+          git commit -q -m "Pruebas de regresión: $nuevas fallas arregladas en C-Forge"
+          git push -q origin "$rama"
+          {
+            echo "Fuzz Lab volvió a probar estas fallas y **ya no fallan**: quedan como pruebas de regresión."
+            echo
+            echo "| Prueba | Motor | Tipo | Encontrada en |"
+            echo "|---|---|---|---|"
+            cat ../tabla.md
+          } > ../pr.md
+          gh pr create --repo VemorisSoftware/FuzzLab-Reportes --head "$rama" --title "🧪 Pruebas de regresión de C-Forge ($nuevas)" --body-file ../pr.md > /dev/null
+          echo "PR de pruebas de regresión creado en el repo privado."
